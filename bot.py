@@ -8,6 +8,7 @@ Env:
   DISCORD_CLIENT_ID  (same app as OAuth)
   OAUTH_START_URL    default {API_BASE}/api/discord/oauth/start
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -156,6 +157,16 @@ def save_data(data: dict[str, Any]) -> None:
 
 DATA = load_data()
 
+# discord_id -> expires_at (unix). Users who were shown OAuth link; polled for auto role grant.
+_PENDING_OAUTH: dict[int, int] = {}
+
+
+def track_pending_oauth(user_id: int, minutes: int = 15) -> None:
+    """Remember that this user started OAuth; background task will grant roles when authorized."""
+    _PENDING_OAUTH[int(user_id)] = int(time.time()) + minutes * 60
+
+
+
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
@@ -302,6 +313,7 @@ async def grant_oauth_roles(member: discord.Member, guild_ids: list) -> list[str
 
 
 def oauth_authorize_view(user_id: int) -> discord.ui.View:
+    track_pending_oauth(user_id)
     view = discord.ui.View(timeout=300)
     view.add_item(
         discord.ui.Button(
@@ -425,7 +437,7 @@ async def open_ticket(
         text = (
             f"{member.mention}\n"
             f"No matching executor communities on your authorized account.\n"
-            f"Agree to <#{RULES_CHANNEL_ID}>, TOS & Privacy — reply **yes** / **no**."
+            f"Moderators will assist you shortly."
         )
     if extra:
         text += f"\n{extra}"
@@ -865,6 +877,8 @@ async def on_ready():
         github_watcher.start()
     if not ticket_cleaner.is_running():
         ticket_cleaner.start()
+    if not oauth_poller.is_running():
+        oauth_poller.start()
 
 
 @bot.event
@@ -1077,10 +1091,12 @@ async def on_message(message: discord.Message):
             # Not authorized - send link
             reply_msg = None
             try:
+                track_pending_oauth(message.author.id)
                 reply_msg = await message.reply(
                     f"{message.author.mention} **Verify / authorize the bot**\n"
-                    "1. Open the link (identify + guilds)\n"
-                    "2. Then use **🔑 Activate key** on the license panel",
+                    "1. Open the link (**identify** + **guilds**)\n"
+                    "2. After **Connected**, roles are granted automatically (~30s)\n"
+                    "3. Then use **🔑 Activate key** on the license panel",
                     view=oauth_authorize_view(message.author.id),
                     mention_author=True,
                 )
@@ -1102,32 +1118,13 @@ async def on_message(message: discord.Message):
                 asyncio.create_task(_delete_verify_reply(reply_msg))
             return
 
-    if not isinstance(message.author, discord.Member):
-        return
-    meta = (DATA.get("pending_tickets") or {}).get(str(message.channel.id))
-    if not meta or int(meta.get("user_id", 0)) != message.author.id:
-        return
-    text = (message.content or "").strip().lower()
-    if text in YES_WORDS or any(text.startswith(w + " ") for w in YES_WORDS):
-        if meta.get("verified"):
-            return
-        v = message.guild.get_role(VERIFIED_ROLE_ID)
-        u = message.guild.get_role(AUTO_ROLE_ID)
-        try:
-            if v and v not in message.author.roles:
-                await message.author.add_roles(v, reason="TOS yes")
-            if u and u in message.author.roles:
-                await message.author.remove_roles(u, reason="verified")
-        except Exception as e:
-            await message.channel.send(f"Role error: `{e}`")
-            return
-        await ensure_free_rewire_role(message.author)
-        DATA["pending_tickets"][str(message.channel.id)]["verified"] = True
-        DATA["pending_tickets"][str(message.channel.id)]["close_at"] = int(time.time()) + 1800
-        save_data(DATA)
-        await message.channel.send(f"{message.author.mention} verified. Closes in 30 min.")
-    elif text in NO_WORDS:
-        await message.channel.send("You need to agree to TOS/rules.")
+    # ----- ticket close timer: any message resets 30 min countdown -----
+    if isinstance(message.channel, discord.TextChannel):
+        meta = (DATA.get("pending_tickets") or {}).get(str(message.channel.id))
+        if meta and meta.get("closing"):
+            meta["close_at"] = int(time.time()) + 1800
+            DATA["pending_tickets"][str(message.channel.id)] = meta
+            save_data(DATA)
 
 
 @bot.event
@@ -1222,20 +1219,123 @@ async def setup_react() -> None:
         print("[GH] react", e)
 
 
-@tasks.loop(minutes=5)
+async def archive_ticket_log(channel: discord.TextChannel, meta: dict) -> None:
+    """Dump full message history of a ticket into JOIN_LOG_CHANNEL_ID before delete."""
+    try:
+        log_ch = channel.guild.get_channel(JOIN_LOG_CHANNEL_ID)
+        if log_ch is None:
+            try:
+                log_ch = await bot.fetch_channel(JOIN_LOG_CHANNEL_ID)
+            except Exception:
+                log_ch = None
+        if not isinstance(log_ch, discord.TextChannel):
+            print(f"[GH] archive: log channel {JOIN_LOG_CHANNEL_ID} missing")
+            return
+        lines: list[str] = []
+        async for msg in channel.history(limit=None, oldest_first=True):
+            ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S") if msg.created_at else "?"
+            author = f"{msg.author} ({msg.author.id})" if msg.author else "?"
+            content = (msg.content or "").strip()
+            if msg.attachments:
+                att = " | attachments: " + ", ".join(a.url for a in msg.attachments)
+            else:
+                att = ""
+            if msg.embeds:
+                emb = f" | embeds: {len(msg.embeds)}"
+            else:
+                emb = ""
+            lines.append(f"[{ts}] {author}: {content}{att}{emb}")
+        header = (
+            f"**Ticket closed log** · `#{channel.name}` (`{channel.id}`)\n"
+            f"Owner: <@{meta.get('user_id', 0)}> · kind: `{meta.get('kind', '?')}` · "
+            f"closed by: `{meta.get('closed_by', 'timer')}`"
+        )
+        # Discord message limit 2000; chunk
+        body = "\n".join(lines) if lines else "(no messages)"
+        chunks: list[str] = []
+        cur = ""
+        for line in body.split("\n"):
+            if len(cur) + len(line) + 1 > 1900:
+                chunks.append(cur)
+                cur = line
+            else:
+                cur = (cur + "\n" + line) if cur else line
+        if cur:
+            chunks.append(cur)
+        await log_ch.send(header)
+        for i, chunk in enumerate(chunks):
+            prefix = f"```\n" if i == 0 else f"```(cont.)\n"
+            await log_ch.send(f"{prefix}{chunk[:1900]}\n```")
+    except Exception as e:
+        print(f"[GH] archive_ticket_log failed: {e}")
+
+
+@tasks.loop(minutes=1)
 async def ticket_cleaner():
     now = int(time.time())
     for ch_id, meta in list((DATA.get("pending_tickets") or {}).items()):
         if not meta.get("close_at") or now < int(meta["close_at"]):
             continue
         ch = bot.get_channel(int(ch_id))
-        if ch:
+        if ch and isinstance(ch, discord.TextChannel):
             try:
-                await ch.delete(reason="ticket auto-close")
-            except Exception:
-                pass
+                await archive_ticket_log(ch, meta)
+            except Exception as e:
+                print(f"[GH] archive before delete: {e}")
+            try:
+                await ch.delete(reason=f"ticket auto-close: {meta.get('closed_by', 'timer')}")
+            except Exception as e:
+                print(f"[GH] ticket delete failed {ch_id}: {e}")
         DATA["pending_tickets"].pop(str(ch_id), None)
         save_data(DATA)
+
+
+
+@tasks.loop(seconds=30)
+async def oauth_poller():
+    """After user opens OAuth link, grant roles automatically without a second /verify."""
+    now = int(time.time())
+    expired = [uid for uid, exp in list(_PENDING_OAUTH.items()) if exp < now]
+    for uid in expired:
+        _PENDING_OAUTH.pop(uid, None)
+    if not _PENDING_OAUTH:
+        return
+    for guild in bot.guilds:
+        for uid in list(_PENDING_OAUTH.keys()):
+            try:
+                st = await fetch_oauth_status(uid)
+            except Exception as e:
+                print(f"[GH] oauth_poller status {uid}: {e}")
+                continue
+            if not st.get("authorized"):
+                continue
+            member = guild.get_member(uid)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(uid)
+                except Exception:
+                    continue
+            try:
+                granted = await grant_oauth_roles(member, st.get("guild_ids") or [])
+                _PENDING_OAUTH.pop(uid, None)
+                if granted:
+                    log_ch = guild.get_channel(JOIN_LOG_CHANNEL_ID)
+                    if log_ch and isinstance(log_ch, discord.TextChannel):
+                        await log_ch.send(
+                            f"✅ {member.mention} OAuth complete (auto). Granted: {', '.join(granted)}"
+                        )
+                    # Try notify in verify channel
+                    try:
+                        vch = guild.get_channel(VERIFY_CMD_CHANNEL_ID)
+                        if isinstance(vch, discord.TextChannel):
+                            await vch.send(
+                                f"✅ {member.mention} authorized — roles granted: {', '.join(granted)}",
+                                delete_after=120,
+                            )
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[GH] oauth_poller grant {uid}: {e}")
 
 
 @tasks.loop(minutes=3)
@@ -1853,11 +1953,15 @@ async def cmd_lookup_key(interaction: discord.Interaction, key: str):
     )
 
 
-@bot.tree.command(name="close_ticket", description="Close this ticket channel")
+@bot.tree.command(name="close_ticket", description="Schedule ticket close (admin only, 30 min)")
 @app_commands.describe(reason="Optional reason")
 async def cmd_close_ticket(interaction: discord.Interaction, reason: str = ""):
     if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
         await interaction.response.send_message("Use in a ticket text channel.", ephemeral=True)
+        return
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not is_admin(member):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
         return
     ch = interaction.channel
     meta = (DATA.get("pending_tickets") or {}).get(str(ch.id))
@@ -1865,32 +1969,33 @@ async def cmd_close_ticket(interaction: discord.Interaction, reason: str = ""):
     if not is_ticket:
         await interaction.response.send_message("This is not a tracked ticket channel.", ephemeral=True)
         return
-    member = interaction.user
-    if not isinstance(member, discord.Member):
-        await interaction.response.send_message("Server only.", ephemeral=True)
-        return
-    owner_id = int((meta or {}).get("user_id") or 0)
-    allowed = (
-        is_mod(member)
-        or is_admin(member)
-        or (owner_id and member.id == owner_id)
-        or member.guild_permissions.manage_channels
-    )
-    if not allowed:
-        await interaction.response.send_message("Only ticket owner or staff can close.", ephemeral=True)
-        return
-    await interaction.response.send_message("Closing ticket…")
-    if meta:
-        DATA.get("pending_tickets", {}).pop(str(ch.id), None)
-        save_data(DATA)
     why = reason.strip() or f"Closed by {member}"
-    try:
-        await ch.delete(reason=why[:400])
-    except Exception as e:
-        try:
-            await interaction.followup.send(f"Could not delete: `{e}`")
-        except Exception:
-            pass
+    # Ensure ticket is tracked so cleaner + activity reset work
+    if not meta:
+        meta = {
+            "user_id": 0,
+            "created": int(time.time()),
+            "kind": "manual",
+        }
+    meta["closing"] = True
+    meta["close_at"] = int(time.time()) + 1800
+    meta["closed_by"] = str(member.id)
+    meta["close_reason"] = why[:400]
+    DATA.setdefault("pending_tickets", {})[str(ch.id)] = meta
+    save_data(DATA)
+
+    emb = discord.Embed(
+        title="Ticket closed",
+        description=(
+            f"This ticket was closed by {member.mention}.\n"
+            f"**It will be deleted in 30 minutes.**\n"
+            f"Any new message in this channel resets the timer to 30 minutes.\n"
+            + (f"\n**Reason:** {why}" if reason.strip() else "")
+        ),
+        color=0xE74C3C,
+    )
+    emb.set_footer(text="Full chat log will be saved when the channel is deleted.")
+    await interaction.response.send_message(embed=emb)
 
 
 @bot.tree.command(name="ticket_panel", description="Post support ticket panel (admin)")
@@ -2024,8 +2129,11 @@ async def cmd_verify(interaction: discord.Interaction):
                 ephemeral=True,
             )
         return
+    track_pending_oauth(interaction.user.id)
     await interaction.followup.send(
-        "Authorize the bot (identify + guilds), then run `/verify` again to get your roles.",
+        "Authorize the bot (**identify** + **guilds**). "
+        "After you finish the Connected page, roles are granted **automatically** "
+        "(usually within ~30 seconds — no need to run `/verify` again).",
         view=oauth_authorize_view(interaction.user.id),
         ephemeral=True,
     )
