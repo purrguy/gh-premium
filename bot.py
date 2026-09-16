@@ -49,6 +49,7 @@ VERIFY_CMD_CHANNEL_ID = int(os.getenv("VERIFY_CMD_CHANNEL_ID", "1544375383338655
 ENG_GENERAL_ID = int(os.getenv("ENG_GENERAL_ID", "1441745275268894801"))
 RU_GENERAL_ID = int(os.getenv("RU_GENERAL_ID", "1422222410454798539"))
 TICKET_PANEL_CHANNEL_ID = int(os.getenv("TICKET_PANEL_CHANNEL_ID", "1430602816946176080"))
+HONEYPOT_CHANNEL_ID = int(os.getenv("HONEYPOT_CHANNEL_ID", "1549865153300930747"))
 CAT_BUG_REPORT = int(os.getenv("CAT_BUG_REPORT", "1448630113573801994"))
 CAT_SUGGESTION = int(os.getenv("CAT_SUGGESTION", "1449352046200361063"))
 CAT_SUPPORT = int(os.getenv("CAT_SUPPORT", "1426220048183328881"))
@@ -135,6 +136,8 @@ _default_data: dict[str, Any] = {
     "react_message_id": None,
     "file_sha": {},
     "pending_tickets": {},
+    "honeypot_kicks": 0,
+    "honeypot_message_id": None,
     "message_whitelist": [],
 }
 
@@ -873,6 +876,7 @@ async def on_ready():
     await setup_react()
     await setup_license_panel()
     await setup_ticket_panel()
+    await setup_honeypot()
     if not github_watcher.is_running():
         github_watcher.start()
     if not ticket_cleaner.is_running():
@@ -1001,9 +1005,161 @@ def detect_channel_lang_violation(channel_id: int, text: str) -> str | None:
     return None
 
 
+
+# ----- Honeypot -----
+def honeypot_embed() -> discord.Embed:
+    kicks = int(DATA.get("honeypot_kicks") or 0)
+    emb = discord.Embed(
+        title="🚫 Do not post here",
+        description=(
+            "**This channel is a honeypot.**\n\n"
+            "If you send **any** message here, you will be **kicked** from the server "
+            "and your recent messages may be removed.\n\n"
+            "Staff and bots are ignored."
+        ),
+        color=0xE74C3C,
+    )
+    emb.add_field(name="Kicks", value=str(kicks), inline=True)
+    emb.set_footer(text="Greedy Hudzell · anti-scam trap")
+    return emb
+
+
+async def refresh_honeypot_embed(guild: discord.Guild) -> None:
+    if not HONEYPOT_CHANNEL_ID:
+        return
+    ch = guild.get_channel(HONEYPOT_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        print(f"[GH] honeypot channel missing: {HONEYPOT_CHANNEL_ID}")
+        return
+    mid = DATA.get("honeypot_message_id")
+    emb = honeypot_embed()
+    if mid:
+        try:
+            msg = await ch.fetch_message(int(mid))
+            await msg.edit(embed=emb, content=None)
+            return
+        except Exception:
+            pass
+    # clear other bot embeds optionally — just post new
+    try:
+        msg = await ch.send(embed=emb)
+        DATA["honeypot_message_id"] = str(msg.id)
+        save_data(DATA)
+        try:
+            await msg.pin()
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[GH] honeypot post failed: {e}")
+
+
+async def purge_user_recent_messages(guild: discord.Guild, user_id: int, limit_per_channel: int = 30) -> int:
+    """Delete recent messages from user across text channels (best-effort)."""
+    deleted = 0
+    for ch in guild.text_channels:
+        if ch.id == HONEYPOT_CHANNEL_ID:
+            continue
+        try:
+            perms = ch.permissions_for(guild.me)
+            if not perms.manage_messages or not perms.read_message_history:
+                continue
+        except Exception:
+            continue
+        try:
+            async for msg in ch.history(limit=limit_per_channel):
+                if msg.author and msg.author.id == user_id:
+                    try:
+                        await msg.delete()
+                        deleted += 1
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+    return deleted
+
+
+async def handle_honeypot(message: discord.Message) -> bool:
+    """Return True if message was handled as honeypot trigger."""
+    if not HONEYPOT_CHANNEL_ID or message.channel.id != HONEYPOT_CHANNEL_ID:
+        return False
+    if message.author.bot:
+        return True  # ignore bots, swallow
+    member = message.author
+    if not isinstance(member, discord.Member):
+        return True
+    # staff immune
+    if is_admin(member) or is_mod(member) or is_owner(member):
+        return False
+
+    guild = message.guild
+    uid = member.id
+    name = str(member)
+
+    # delete the bait message
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # purge recent messages
+    purged = 0
+    try:
+        purged = await purge_user_recent_messages(guild, uid, limit_per_channel=40)
+    except Exception as e:
+        print(f"[GH] honeypot purge: {e}")
+
+    # kick
+    kicked = False
+    try:
+        await member.kick(reason="Honeypot channel message")
+        kicked = True
+    except Exception as e:
+        print(f"[GH] honeypot kick failed {uid}: {e}")
+
+    if kicked:
+        DATA["honeypot_kicks"] = int(DATA.get("honeypot_kicks") or 0) + 1
+        save_data(DATA)
+        try:
+            await refresh_honeypot_embed(guild)
+        except Exception as e:
+            print(f"[GH] honeypot refresh: {e}")
+
+    # log
+    try:
+        log_ch = guild.get_channel(JOIN_LOG_CHANNEL_ID)
+        if isinstance(log_ch, discord.TextChannel):
+            emb = discord.Embed(
+                title="Honeypot kick",
+                description=f"**{name}** (`{uid}`) posted in <#{HONEYPOT_CHANNEL_ID}>",
+                color=0xC0392B,
+            )
+            emb.add_field(name="Kicked", value=str(kicked), inline=True)
+            emb.add_field(name="Messages deleted", value=str(purged), inline=True)
+            emb.add_field(name="Total kicks", value=str(DATA.get("honeypot_kicks") or 0), inline=True)
+            await log_ch.send(embed=emb)
+    except Exception as e:
+        print(f"[GH] honeypot log: {e}")
+
+    return True
+
+
+async def setup_honeypot() -> None:
+    for g in bot.guilds:
+        try:
+            await refresh_honeypot_embed(g)
+        except Exception as e:
+            print(f"[GH] setup_honeypot {g.id}: {e}")
+
+
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
+    if not message.guild:
+        return
+    # honeypot first (bots ignored inside handler except channel id match)
+    if message.channel.id == HONEYPOT_CHANNEL_ID:
+        if await handle_honeypot(message):
+            return
+    if message.author.bot:
         return
 
     # ----- language gates: eng general / ru general -----
@@ -1953,6 +2109,22 @@ async def cmd_lookup_key(interaction: discord.Interaction, key: str):
     )
 
 
+
+
+@bot.tree.command(name="honeypot_setup", description="Post/refresh honeypot embed (admin)")
+async def cmd_honeypot_setup(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await refresh_honeypot_embed(interaction.guild)
+    kicks = int(DATA.get("honeypot_kicks") or 0)
+    await interaction.followup.send(
+        f"Honeypot ready in <#{HONEYPOT_CHANNEL_ID}> · kicks **{kicks}**",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="close_ticket", description="Schedule ticket close (admin only, 30 min)")
 @app_commands.describe(reason="Optional reason")
 async def cmd_close_ticket(interaction: discord.Interaction, reason: str = ""):
@@ -1960,12 +2132,12 @@ async def cmd_close_ticket(interaction: discord.Interaction, reason: str = ""):
         await interaction.response.send_message("Use in a ticket text channel.", ephemeral=True)
         return
     member = interaction.user
-    if not isinstance(member, discord.Member) or not is_admin(member):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
+    if not isinstance(member, discord.Member) or not (is_admin(member) or is_mod(member)):
+        await interaction.response.send_message("Admin/mod only.", ephemeral=True)
         return
     ch = interaction.channel
     meta = (DATA.get("pending_tickets") or {}).get(str(ch.id))
-    is_ticket = bool(meta) or (ch.name or "").startswith(("verify-", "help-", "ticket-"))
+    is_ticket = bool(meta) or (ch.name or "").startswith(("verify-", "help-", "ticket-", "bug-", "suggest-", "support-"))
     if not is_ticket:
         await interaction.response.send_message("This is not a tracked ticket channel.", ephemeral=True)
         return
