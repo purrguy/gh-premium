@@ -138,6 +138,8 @@ _default_data: dict[str, Any] = {
     "pending_tickets": {},
     "honeypot_kicks": 0,
     "honeypot_message_id": None,
+    "giveaways": {},
+    "giveaways": {},
     "message_whitelist": [],
 }
 
@@ -857,6 +859,7 @@ async def on_ready():
     bot.add_view(LicensePanelView())
     bot.add_view(TicketPanelView())
     bot.add_view(SessionModView())
+    bot.add_view(GiveawayView())
     try:
         only = os.getenv("GUILD_ID", "").strip()
         guilds = [discord.Object(id=int(only))] if only.isdigit() else list(bot.guilds)
@@ -1006,21 +1009,28 @@ def detect_channel_lang_violation(channel_id: int, text: str) -> str | None:
 
 
 
-# ----- Honeypot -----
+# ----- Honeypot + multi-channel flood -----
+# user_id -> list of (channel_id, message_id, timestamp)
+_RECENT_POSTS: dict[int, list[tuple[int, int, float]]] = {}
+_FLOOD_COOLDOWN: dict[int, float] = {}  # user_id -> until ts
+
+
 def honeypot_embed() -> discord.Embed:
     kicks = int(DATA.get("honeypot_kicks") or 0)
     emb = discord.Embed(
-        title="🚫 Do not post here",
+        title="🚫 DO NOT TYPE HERE",
         description=(
-            "**This channel is a honeypot.**\n\n"
-            "If you send **any** message here, you will be **kicked** from the server "
-            "and your recent messages may be removed.\n\n"
-            "Staff and bots are ignored."
+            "**This channel is a honeypot (anti-scam trap).**\n\n"
+            "Any message here = **instant kick** + purge of your recent messages "
+            "across the server.\n\n"
+            "Staff / bots are ignored.\n"
+            "If you are a real member, **leave this channel**."
         ),
         color=0xE74C3C,
     )
-    emb.add_field(name="Kicks", value=str(kicks), inline=True)
-    emb.set_footer(text="Greedy Hudzell · anti-scam trap")
+    emb.add_field(name="💀 Kicks", value=f"**{kicks}**", inline=True)
+    emb.add_field(name="Channel", value=f"<#{HONEYPOT_CHANNEL_ID}>", inline=True)
+    emb.set_footer(text="Greedy Hudzell · honeypot")
     return emb
 
 
@@ -1040,7 +1050,6 @@ async def refresh_honeypot_embed(guild: discord.Guild) -> None:
             return
         except Exception:
             pass
-    # clear other bot embeds optionally — just post new
     try:
         msg = await ch.send(embed=emb)
         DATA["honeypot_message_id"] = str(msg.id)
@@ -1053,12 +1062,10 @@ async def refresh_honeypot_embed(guild: discord.Guild) -> None:
         print(f"[GH] honeypot post failed: {e}")
 
 
-async def purge_user_recent_messages(guild: discord.Guild, user_id: int, limit_per_channel: int = 30) -> int:
+async def purge_user_recent_messages(guild: discord.Guild, user_id: int, limit_per_channel: int = 40) -> int:
     """Delete recent messages from user across text channels (best-effort)."""
     deleted = 0
     for ch in guild.text_channels:
-        if ch.id == HONEYPOT_CHANNEL_ID:
-            continue
         try:
             perms = ch.permissions_for(guild.me)
             if not perms.manage_messages or not perms.read_message_history:
@@ -1078,68 +1085,148 @@ async def purge_user_recent_messages(guild: discord.Guild, user_id: int, limit_p
     return deleted
 
 
+async def log_moderation(guild: discord.Guild, emb: discord.Embed) -> None:
+    for cid in (JOIN_LOG_CHANNEL_ID, WEBHOOKS_CHANNEL_ID):
+        if not cid:
+            continue
+        ch = guild.get_channel(cid)
+        if isinstance(ch, discord.TextChannel):
+            try:
+                await ch.send(embed=emb)
+                return
+            except Exception:
+                continue
+
+
 async def handle_honeypot(message: discord.Message) -> bool:
-    """Return True if message was handled as honeypot trigger."""
+    """Return True if message was handled as honeypot trigger (always swallow channel)."""
     if not HONEYPOT_CHANNEL_ID or message.channel.id != HONEYPOT_CHANNEL_ID:
         return False
     if message.author.bot:
-        return True  # ignore bots, swallow
+        return True
     member = message.author
     if not isinstance(member, discord.Member):
         return True
-    # staff immune
+    # staff immune — do not delete their messages
     if is_admin(member) or is_mod(member) or is_owner(member):
         return False
 
     guild = message.guild
+    if guild is None:
+        return True
     uid = member.id
     name = str(member)
 
-    # delete the bait message
     try:
         await message.delete()
     except Exception:
         pass
 
-    # purge recent messages
     purged = 0
     try:
-        purged = await purge_user_recent_messages(guild, uid, limit_per_channel=40)
+        purged = await purge_user_recent_messages(guild, uid, limit_per_channel=50)
     except Exception as e:
         print(f"[GH] honeypot purge: {e}")
 
-    # kick
     kicked = False
     try:
-        await member.kick(reason="Honeypot channel message")
+        await member.kick(reason="Honeypot: posted in trap channel")
         kicked = True
+    except discord.Forbidden:
+        print(f"[GH] honeypot kick Forbidden for {uid} — check role hierarchy / Kick Members")
     except Exception as e:
         print(f"[GH] honeypot kick failed {uid}: {e}")
 
-    if kicked:
-        DATA["honeypot_kicks"] = int(DATA.get("honeypot_kicks") or 0) + 1
-        save_data(DATA)
-        try:
-            await refresh_honeypot_embed(guild)
-        except Exception as e:
-            print(f"[GH] honeypot refresh: {e}")
-
-    # log
+    DATA["honeypot_kicks"] = int(DATA.get("honeypot_kicks") or 0) + (1 if kicked else 0)
+    save_data(DATA)
     try:
-        log_ch = guild.get_channel(JOIN_LOG_CHANNEL_ID)
-        if isinstance(log_ch, discord.TextChannel):
-            emb = discord.Embed(
-                title="Honeypot kick",
-                description=f"**{name}** (`{uid}`) posted in <#{HONEYPOT_CHANNEL_ID}>",
-                color=0xC0392B,
-            )
-            emb.add_field(name="Kicked", value=str(kicked), inline=True)
-            emb.add_field(name="Messages deleted", value=str(purged), inline=True)
-            emb.add_field(name="Total kicks", value=str(DATA.get("honeypot_kicks") or 0), inline=True)
-            await log_ch.send(embed=emb)
+        await refresh_honeypot_embed(guild)
     except Exception as e:
-        print(f"[GH] honeypot log: {e}")
+        print(f"[GH] honeypot refresh: {e}")
 
+    emb = discord.Embed(
+        title="🪤 Honeypot triggered",
+        description=f"**{name}** (`{uid}`) posted in <#{HONEYPOT_CHANNEL_ID}>",
+        color=0xC0392B,
+        timestamp=discord.utils.utcnow(),
+    )
+    emb.add_field(name="Kicked", value="✅" if kicked else "❌ failed (perms?)", inline=True)
+    emb.add_field(name="Msgs deleted", value=str(purged), inline=True)
+    emb.add_field(name="Total kicks", value=str(DATA.get("honeypot_kicks") or 0), inline=True)
+    if not kicked:
+        emb.add_field(
+            name="Fix",
+            value="Bot role must be **above** target and have **Kick Members**.",
+            inline=False,
+        )
+    await log_moderation(guild, emb)
+    return True
+
+
+async def handle_multichannel_flood(message: discord.Message) -> bool:
+    """
+    If a user posts in more than 2 different channels within 3 seconds,
+    delete those recent messages and log. Returns True if action taken.
+    """
+    if not isinstance(message.author, discord.Member):
+        return False
+    member = message.author
+    if is_admin(member) or is_mod(member) or is_owner(member) or member.bot:
+        return False
+    if message.channel.id == HONEYPOT_CHANNEL_ID:
+        return False
+
+    uid = member.id
+    now = time.time()
+    if _FLOOD_COOLDOWN.get(uid, 0) > now:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return True
+
+    window = 3.0
+    entries = _RECENT_POSTS.get(uid) or []
+    entries = [e for e in entries if now - e[2] <= window]
+    entries.append((message.channel.id, message.id, now))
+    _RECENT_POSTS[uid] = entries
+
+    channels = {e[0] for e in entries}
+    if len(channels) <= 2:
+        return False
+
+    # flood: >2 channels in 3s
+    _FLOOD_COOLDOWN[uid] = now + 10.0
+    guild = message.guild
+    if guild is None:
+        return False
+
+    deleted = 0
+    for ch_id, msg_id, _ts in list(entries):
+        ch = guild.get_channel(ch_id)
+        if not isinstance(ch, discord.TextChannel):
+            continue
+        try:
+            msg = await ch.fetch_message(msg_id)
+            if msg.author.id == uid:
+                await msg.delete()
+                deleted += 1
+        except Exception:
+            pass
+    _RECENT_POSTS[uid] = []
+
+    emb = discord.Embed(
+        title="⚡ Multi-channel flood",
+        description=(
+            f"**{member}** (`{uid}`) posted in **{len(channels)}** channels "
+            f"within **3s** — messages removed."
+        ),
+        color=0xF39C12,
+        timestamp=discord.utils.utcnow(),
+    )
+    emb.add_field(name="Channels", value=", ".join(f"<#{c}>" for c in channels)[:1000], inline=False)
+    emb.add_field(name="Deleted", value=str(deleted), inline=True)
+    await log_moderation(guild, emb)
     return True
 
 
@@ -1155,12 +1242,18 @@ async def setup_honeypot() -> None:
 async def on_message(message: discord.Message):
     if not message.guild:
         return
-    # honeypot first (bots ignored inside handler except channel id match)
+    # honeypot first
     if message.channel.id == HONEYPOT_CHANNEL_ID:
         if await handle_honeypot(message):
             return
     if message.author.bot:
         return
+    # multi-channel flood (>2 channels / 3s)
+    try:
+        if await handle_multichannel_flood(message):
+            return
+    except Exception as e:
+        print(f"[GH] flood handler: {e}")
 
     # ----- language gates: eng general / ru general -----
     if isinstance(message.author, discord.Member) and not message.author.guild_permissions.manage_messages:
@@ -2538,6 +2631,220 @@ class SessionModView(discord.ui.View):
         await interaction.response.send_modal(
             SessionBanModal(self.key, self.roblox_name or "", self.roblox_id or "")
         )
+
+
+
+
+# ----- Giveaway -----
+_ACTIVE_GIVEAWAYS: dict[int, dict[str, Any]] = {}  # message_id -> meta
+
+
+class GiveawayView(discord.ui.View):
+    def __init__(self, message_id: int = 0):
+        super().__init__(timeout=None)
+        self.message_id = message_id
+
+    @discord.ui.button(label="Enter", style=discord.ButtonStyle.primary, custom_id="gh:giveaway:enter")
+    async def enter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mid = interaction.message.id if interaction.message else 0
+        meta = _ACTIVE_GIVEAWAYS.get(mid) or (DATA.get("giveaways") or {}).get(str(mid))
+        if not meta:
+            await interaction.response.send_message("This giveaway has ended.", ephemeral=True)
+            return
+        if time.time() > float(meta.get("ends_at", 0)):
+            await interaction.response.send_message("This giveaway has ended.", ephemeral=True)
+            return
+        entrants = set(meta.get("entrants") or [])
+        uid = interaction.user.id
+        if uid in entrants:
+            entrants.discard(uid)
+            meta["entrants"] = list(entrants)
+            _ACTIVE_GIVEAWAYS[mid] = meta
+            DATA.setdefault("giveaways", {})[str(mid)] = meta
+            save_data(DATA)
+            await interaction.response.send_message("You left the giveaway.", ephemeral=True)
+            return
+        entrants.add(uid)
+        meta["entrants"] = list(entrants)
+        _ACTIVE_GIVEAWAYS[mid] = meta
+        DATA.setdefault("giveaways", {})[str(mid)] = meta
+        save_data(DATA)
+        await interaction.response.send_message(
+            "You are in! ({} entrants)".format(len(entrants)), ephemeral=True
+        )
+
+
+async def finish_giveaway(channel: discord.TextChannel, message_id: int) -> None:
+    meta = _ACTIVE_GIVEAWAYS.pop(message_id, None) or (DATA.get("giveaways") or {}).get(str(message_id))
+    if not meta:
+        return
+    entrants = list(meta.get("entrants") or [])
+    winners_n = max(1, int(meta.get("winners") or 1))
+    prize = meta.get("prize") or "prize"
+    random.shuffle(entrants)
+    winners = entrants[: min(winners_n, len(entrants))]
+    try:
+        msg = await channel.fetch_message(message_id)
+    except Exception:
+        msg = None
+    if not winners:
+        text = "**Giveaway ended** — **{}**\nNo valid entrants.".format(prize)
+    else:
+        mentions = ", ".join("<@{}>".format(w) for w in winners)
+        text = "**Giveaway ended** — **{}**\nWinners: {}".format(prize, mentions)
+    text = text.replace("<<<NL>>>", "\n")
+    emb = discord.Embed(title="Giveaway ended", description=text, color=0x2ECC71)
+    emb.add_field(name="Entrants", value=str(len(entrants)), inline=True)
+    if msg:
+        try:
+            await msg.edit(embed=emb, view=None)
+        except Exception:
+            await channel.send(embed=emb)
+    else:
+        await channel.send(embed=emb)
+    DATA.setdefault("giveaways", {}).pop(str(message_id), None)
+    save_data(DATA)
+
+
+@bot.tree.command(name="giveaway", description="Start a giveaway (admin/mod)")
+@app_commands.describe(
+    prize="What users win",
+    duration_minutes="Duration in minutes (default 60)",
+    winners="Number of winners (default 1)",
+    channel="Channel to post (default current)",
+)
+async def cmd_giveaway(
+    interaction: discord.Interaction,
+    prize: str,
+    duration_minutes: int = 60,
+    winners: int = 1,
+    channel: Optional[discord.TextChannel] = None,
+):
+    if not isinstance(interaction.user, discord.Member) or not (is_admin(interaction.user) or is_mod(interaction.user)):
+        await interaction.response.send_message("Admin/mod only.", ephemeral=True)
+        return
+    duration_minutes = max(1, min(duration_minutes, 60 * 24 * 14))
+    winners = max(1, min(winners, 20))
+    ch = channel or (interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None)
+    if not isinstance(ch, discord.TextChannel):
+        await interaction.response.send_message("Need a text channel.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ends_at = time.time() + duration_minutes * 60
+    desc = "**Prize:** {}\n\nClick **Enter** to join!".format(prize)
+    desc = desc.replace("<<<NL>>>", "\n")
+    emb = discord.Embed(title="Giveaway", description=desc, color=0x9B59B6)
+    emb.add_field(name="Winners", value=str(winners), inline=True)
+    emb.add_field(name="Ends", value="<t:{}:R>".format(int(ends_at)), inline=True)
+    emb.set_footer(text="Hosted by {}".format(interaction.user))
+    view = GiveawayView()
+    msg = await ch.send(embed=emb, view=view)
+    meta = {
+        "prize": prize[:200],
+        "winners": winners,
+        "ends_at": ends_at,
+        "entrants": [],
+        "channel_id": ch.id,
+        "host": interaction.user.id,
+    }
+    _ACTIVE_GIVEAWAYS[msg.id] = meta
+    DATA.setdefault("giveaways", {})[str(msg.id)] = meta
+    save_data(DATA)
+    await interaction.followup.send("Giveaway posted in {}".format(ch.mention), ephemeral=True)
+
+    async def _end_later():
+        await asyncio.sleep(duration_minutes * 60)
+        try:
+            await finish_giveaway(ch, msg.id)
+        except Exception as e:
+            print("[GH] giveaway end:", e)
+
+    asyncio.create_task(_end_later())
+
+
+@bot.tree.command(name="giveaway_end", description="Force-end a giveaway by message id (admin)")
+@app_commands.describe(message_id="Giveaway message ID")
+async def cmd_giveaway_end(interaction: discord.Interaction, message_id: str):
+    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("Use in the giveaway channel.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        mid = int(message_id.strip())
+    except ValueError:
+        await interaction.followup.send("Invalid message id.", ephemeral=True)
+        return
+    await finish_giveaway(interaction.channel, mid)
+    await interaction.followup.send("Ended.", ephemeral=True)
+
+
+@bot.tree.command(name="stats", description="Server / key stats")
+async def cmd_stats(interaction: discord.Interaction):
+    guild = interaction.guild
+    member = interaction.user
+    staff = isinstance(member, discord.Member) and (is_admin(member) or is_mod(member) or is_owner(member))
+
+    verified_count = 0
+    total = 0
+    if guild:
+        total = guild.member_count or len(guild.members)
+        vrole = guild.get_role(VERIFIED_ROLE_ID)
+        if vrole:
+            verified_count = len(vrole.members)
+        else:
+            for m in guild.members:
+                if VERIFIED_ROLE_ID in {r.id for r in m.roles}:
+                    verified_count += 1
+
+    if not staff:
+        emb = discord.Embed(title="Greedy Hudzell Stats", color=0xD4AF37)
+        emb.add_field(name="Members", value=str(total), inline=True)
+        emb.add_field(name="Verified", value=str(verified_count), inline=True)
+        emb.add_field(name="Honeypot kicks", value=str(DATA.get("honeypot_kicks") or 0), inline=True)
+        await interaction.response.send_message(embed=emb)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    key_lines = []
+    for path in ("/admin/stats", "/admin/keys/stats", "/api/admin/stats"):
+        try:
+            status, data = await api("GET", path)
+            if status == 200 and isinstance(data, dict) and (
+                data.get("ok") or data.get("success") or "keys" in data or "week" in data or "month" in data
+            ):
+                week = data.get("week") or data.get("keys_week") or data.get("activated_week")
+                month = data.get("month") or data.get("keys_month") or data.get("activated_month")
+                total_k = data.get("total") or data.get("keys_total") or data.get("activated_total")
+                active = data.get("active") or data.get("keys_active")
+                if week is not None:
+                    key_lines.append("Week: **{}**".format(week))
+                if month is not None:
+                    key_lines.append("Month: **{}**".format(month))
+                if total_k is not None:
+                    key_lines.append("Total: **{}**".format(total_k))
+                if active is not None:
+                    key_lines.append("Active: **{}**".format(active))
+                if not key_lines:
+                    key_lines.append("```json\n{}\n```".format(json.dumps(data, indent=2)[:800]))
+                break
+        except Exception:
+            continue
+    if not key_lines:
+        key_lines.append(
+            "_No stats endpoint yet — add `/admin/stats` on API (week, month, total, active)._"
+        )
+
+    emb = discord.Embed(title="Staff stats", color=0x3498DB)
+    emb.add_field(name="Members", value=str(total), inline=True)
+    emb.add_field(name="Verified", value=str(verified_count), inline=True)
+    emb.add_field(name="Honeypot kicks", value=str(DATA.get("honeypot_kicks") or 0), inline=True)
+    emb.add_field(name="Open tickets", value=str(len(DATA.get("pending_tickets") or {})), inline=True)
+    emb.add_field(name="Keys", value="\n".join(key_lines)[:1000], inline=False)
+    await interaction.followup.send(embed=emb, ephemeral=True)
+
 
 
 def main():
