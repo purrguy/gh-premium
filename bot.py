@@ -8,7 +8,6 @@ Env:
   DISCORD_CLIENT_ID  (same app as OAuth)
   OAUTH_START_URL    default {API_BASE}/api/discord/oauth/start
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -168,7 +167,6 @@ DATA = load_data()
 BOT_STARTED_AT = int(time.time())
 
 # ===== Ticket AI (inlined from ticket_ai.py) =====
-from __future__ import annotations
 
 import os
 import re
