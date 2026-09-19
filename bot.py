@@ -26,6 +26,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+try:
+    import ticket_ai
+except Exception:
+    ticket_ai = None  # type: ignore
+
 API_BASE = os.getenv("API_BASE", "https://greedyhudzell.xyz").rstrip("/")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
@@ -139,6 +144,9 @@ _default_data: dict[str, Any] = {
     "honeypot_kicks": 0,
     "honeypot_message_id": None,
     "giveaways": {},
+    "ai_daily": {},
+    "ai_logs": [],
+
     "giveaways": {},
     "message_whitelist": [],
 }
@@ -161,6 +169,7 @@ def save_data(data: dict[str, Any]) -> None:
 
 
 DATA = load_data()
+BOT_STARTED_AT = int(time.time())
 
 # discord_id -> expires_at (unix). Users who were shown OAuth link; polled for auto role grant.
 _PENDING_OAUTH: dict[int, int] = {}
@@ -860,6 +869,7 @@ async def on_ready():
     bot.add_view(TicketPanelView())
     bot.add_view(SessionModView())
     bot.add_view(GiveawayView())
+    bot.add_view(KeyGrantView())
     try:
         only = os.getenv("GUILD_ID", "").strip()
         guilds = [discord.Object(id=int(only))] if only.isdigit() else list(bot.guilds)
@@ -1238,6 +1248,456 @@ async def setup_honeypot() -> None:
             print(f"[GH] setup_honeypot {g.id}: {e}")
 
 
+
+# ----- Ticket AI -----
+AI_DAILY_LIMIT = 7
+MOD_PING_ROLE = MOD_ROLE_ID
+OWNER_PING = 1332400034892873761
+
+
+def _ai_day_key() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def ai_count_today(user_id: int) -> int:
+    day = _ai_day_key()
+    bucket = (DATA.get("ai_daily") or {}).get(day) or {}
+    return int(bucket.get(str(user_id), 0))
+
+
+def ai_bump(user_id: int) -> int:
+    day = _ai_day_key()
+    DATA.setdefault("ai_daily", {})
+    DATA["ai_daily"].setdefault(day, {})
+    uid = str(user_id)
+    DATA["ai_daily"][day][uid] = int(DATA["ai_daily"][day].get(uid, 0)) + 1
+    # prune old days
+    for k in list(DATA["ai_daily"].keys()):
+        if k != day:
+            DATA["ai_daily"].pop(k, None)
+    save_data(DATA)
+    return DATA["ai_daily"][day][uid]
+
+
+def ai_log_entry(entry: dict) -> None:
+    logs = DATA.setdefault("ai_logs", [])
+    logs.append(entry)
+    if len(logs) > 300:
+        DATA["ai_logs"] = logs[-300:]
+    save_data(DATA)
+
+
+async def get_script_status_tag(guild: discord.Guild | None) -> str:
+    """Read status channel name → working / possible_ban / down / testing / unknown."""
+    if not guild or not STATUS_CHANNEL_ID:
+        return "unknown"
+    ch = guild.get_channel(STATUS_CHANNEL_ID)
+    if not isinstance(ch, discord.abc.GuildChannel):
+        try:
+            ch = await bot.fetch_channel(STATUS_CHANNEL_ID)
+        except Exception:
+            return "unknown"
+    name = (getattr(ch, "name", "") or "").lower()
+    for key, mapped in STATUS_MAP.items():
+        if key.replace("_", "-") in name or key in name or mapped.lower() in name:
+            return key
+        # emoji names
+        if key == "working" and "working" in name:
+            return "working"
+        if key == "possible_ban" and ("possible" in name or "possible-ban" in name or "possible_ban" in name):
+            return "possible_ban"
+        if key == "down" and "down" in name:
+            return "down"
+        if key == "testing" and "testing" in name:
+            return "testing"
+    if "working" in name:
+        return "working"
+    if "possible" in name:
+        return "possible_ban"
+    if "down" in name:
+        return "down"
+    if "testing" in name:
+        return "testing"
+    return "unknown"
+
+
+class KeyGrantView(discord.ui.View):
+    """Yes/No in join-log channel — only mod/owner."""
+
+    def __init__(self, target_id: int = 0, ticket_ch_id: int = 0):
+        super().__init__(timeout=None)
+        self.target_id = target_id
+        self.ticket_ch_id = ticket_ch_id
+
+    async def _allowed(self, interaction: discord.Interaction) -> bool:
+        u = interaction.user
+        if not isinstance(u, discord.Member):
+            return False
+        return is_mod(u) or is_admin(u) or is_owner(u)
+
+    @discord.ui.button(label="Yes — grant key", style=discord.ButtonStyle.success, custom_id="gh:ai:key:yes")
+    async def yes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._allowed(interaction):
+            await interaction.response.send_message("Mod/owner only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        # recover ids from message embed footer if view restarted
+        target_id = self.target_id
+        ticket_ch_id = self.ticket_ch_id
+        if interaction.message and interaction.message.embeds:
+            emb0 = interaction.message.embeds[0]
+            if emb0.footer and emb0.footer.text:
+                # format: uid=... ticket=...
+                for part in emb0.footer.text.split():
+                    if part.startswith("uid="):
+                        try:
+                            target_id = int(part.split("=", 1)[1])
+                        except Exception:
+                            pass
+                    if part.startswith("ticket="):
+                        try:
+                            ticket_ch_id = int(part.split("=", 1)[1])
+                        except Exception:
+                            pass
+        # grant via API
+        payload = {
+            "discord_id": str(target_id),
+            "plan": "free",
+            "by_discord": str(interaction.user.id),
+            "reason": "AI KEY_REQUEST approved",
+        }
+        status, data = await api("POST", "/admin/create-key", payload)
+        if status != 200 or not (_api_ok(data) or data.get("success") or data.get("key")):
+            status2, data2 = await api("POST", "/admin/grant-key", payload)
+            if status2 == 200 and (_api_ok(data2) or data2.get("key")):
+                data = data2
+            else:
+                await interaction.followup.send(
+                    f"API failed create-key/grant-key:\n`{data}`",
+                    ephemeral=True,
+                )
+                return
+        key_val = data.get("key") or data.get("license") or data.get("code") or "(see API)"
+        # DM / ticket notify
+        guild = interaction.guild
+        member = guild.get_member(target_id) if guild else None
+        note = f"Staff approved a free key for <@{target_id}> by {interaction.user.mention}."
+        if guild and ticket_ch_id:
+            tch = guild.get_channel(ticket_ch_id)
+            if isinstance(tch, discord.TextChannel):
+                try:
+                    await tch.send(
+                        f"{note}\nCheck DM / license panel. Key issued."
+                        if key_val == "(see API)"
+                        else f"{note}\nKey: ||`{key_val}`|| (activate on the panel)."
+                    )
+                except Exception:
+                    pass
+        if member:
+            try:
+                await member.send(
+                    f"Your free key request was **approved**.\n"
+                    + (f"Key: `{key_val}`\n" if key_val != "(see API)" else "")
+                    + "Activate via the license panel after OAuth verify."
+                )
+            except Exception:
+                pass
+        try:
+            await interaction.message.edit(view=None)
+        except Exception:
+            pass
+        await interaction.followup.send("Granted.", ephemeral=True)
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.danger, custom_id="gh:ai:key:no")
+    async def no_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._allowed(interaction):
+            await interaction.response.send_message("Mod/owner only.", ephemeral=True)
+            return
+        try:
+            await interaction.message.edit(view=None)
+        except Exception:
+            pass
+        await interaction.response.send_message("Denied — no key issued.", ephemeral=True)
+
+
+async def post_key_request(guild: discord.Guild, member: discord.Member, ticket_ch: discord.TextChannel, snippet: str) -> None:
+    log_ch = guild.get_channel(JOIN_LOG_CHANNEL_ID)
+    if not isinstance(log_ch, discord.TextChannel):
+        try:
+            log_ch = await bot.fetch_channel(JOIN_LOG_CHANNEL_ID)
+        except Exception:
+            log_ch = None
+    if not isinstance(log_ch, discord.TextChannel):
+        await ticket_ch.send(
+            f"<@&{MOD_PING_ROLE}> <@{OWNER_PING}> key request (log channel missing) from {member.mention}"
+        )
+        return
+    emb = discord.Embed(
+        title="AI KEY_REQUEST",
+        description=(
+            f"**User:** {member.mention} (`{member.id}`)\n"
+            f"**Ticket:** {ticket_ch.mention}\n"
+            f"**Snippet:** {snippet[:400]}"
+        ),
+        color=0xF1C40F,
+        timestamp=discord.utils.utcnow(),
+    )
+    emb.set_footer(text=f"uid={member.id} ticket={ticket_ch.id}")
+    view = KeyGrantView(member.id, ticket_ch.id)
+    await log_ch.send(
+        content=f"<@&{MOD_PING_ROLE}> <@{OWNER_PING}>",
+        embed=emb,
+        view=view,
+    )
+    await ticket_ch.send(
+        f"{member.mention} Your free-key request was sent to staff. Please wait."
+    )
+
+
+async def handle_ticket_ai(message: discord.Message) -> bool:
+    """Process AI for ticket channels. Return True if handled (caller may return)."""
+    if ticket_ai is None:
+        return False
+    if not isinstance(message.channel, discord.TextChannel) or not message.guild:
+        return False
+    meta = (DATA.get("pending_tickets") or {}).get(str(message.channel.id))
+    if not meta:
+        return False
+    # only tickets created after this bot process started (or with created field)
+    created = int(meta.get("created") or 0)
+    if created and created < BOT_STARTED_AT - 5:
+        # still allow if ticket is open; user asked "after bot creation" for NEW tickets
+        # Skip only very old if you want strict — we allow all open pending_tickets
+        pass
+    author = message.author
+    if not isinstance(author, discord.Member):
+        return False
+    if author.bot:
+        return False
+    if is_mod(author) or is_admin(author) or is_owner(author):
+        return False
+
+    # images / attachments without being pure text FAQ
+    if message.attachments and not (message.content or "").strip():
+        try:
+            await message.channel.send(
+                f"<@&{MOD_PING_ROLE}> <@{OWNER_PING}> "
+                f"{author.mention} sent an image/attachment — please review."
+            )
+        except Exception:
+            pass
+        ai_log_entry(
+            {
+                "t": int(time.time()),
+                "uid": author.id,
+                "ch": message.channel.id,
+                "kind": "image_ping",
+            }
+        )
+        return True
+
+    content = (message.content or "").strip()
+    if not content:
+        return False
+
+    used = ai_count_today(author.id)
+    if used >= AI_DAILY_LIMIT:
+        try:
+            await message.channel.send(
+                f"{author.mention} AI daily limit (**{AI_DAILY_LIMIT}**) reached. "
+                "A moderator will help you further."
+            )
+        except Exception:
+            pass
+        return True
+
+    status_tag = await get_script_status_tag(message.guild)
+    local = ticket_ai.classify_local(content)
+
+    # Ban flow without API
+    if local == "BAN_FLOW" or ticket_ai.SCRIPT_BAN_HINT.search(content):
+        if status_tag == "possible_ban":
+            reply = (
+                "The script is currently vulnerable to automatic/manual bans. "
+                "This is on your side. You were warned."
+            )
+            await message.channel.send(reply)
+            ai_bump(author.id)
+            ai_log_entry(
+                {
+                    "t": int(time.time()),
+                    "uid": author.id,
+                    "ch": message.channel.id,
+                    "kind": "ban_warn",
+                    "status": status_tag,
+                    "user": content[:200],
+                    "reply": reply,
+                }
+            )
+            return True
+        if status_tag == "working":
+            await message.channel.send(
+                f"<@&{MOD_PING_ROLE}> {author.mention} reported a ban while status is **working**."
+            )
+            ai_bump(author.id)
+            ai_log_entry(
+                {
+                    "t": int(time.time()),
+                    "uid": author.id,
+                    "ch": message.channel.id,
+                    "kind": "ban_ping_mods",
+                    "status": status_tag,
+                    "user": content[:200],
+                }
+            )
+            return True
+        # other statuses → mild escalate
+        await message.channel.send(
+            f"<@&{MOD_PING_ROLE}> Ban report (status: `{status_tag}`). Staff please check."
+        )
+        ai_bump(author.id)
+        return True
+
+    if local == "PING_OWNER_PAYMENT" or (
+        ticket_ai.PAYMENT_KEYWORDS.search(content)
+        and not ticket_ai.KEY_REQUEST_HINT.search(content)
+    ):
+        # payment → owner only + pricing hint
+        await message.channel.send(
+            f"<@{OWNER_PING}> payment-related question from {author.mention}.\n"
+            f"Paid plans: {ticket_ai.PRICING_URL}"
+        )
+        ai_bump(author.id)
+        ai_log_entry(
+            {
+                "t": int(time.time()),
+                "uid": author.id,
+                "ch": message.channel.id,
+                "kind": "payment_owner",
+                "user": content[:200],
+            }
+        )
+        return True
+
+    # Call Muse
+    try:
+        async with message.channel.typing():
+            reply = await ticket_ai.ask_muse(content, script_status=status_tag, timeout_s=50)
+    except Exception as e:
+        print("[GH] ask_muse", e)
+        reply = None
+
+    if not reply:
+        ai_log_entry(
+            {
+                "t": int(time.time()),
+                "uid": author.id,
+                "ch": message.channel.id,
+                "kind": "ai_fail",
+                "user": content[:200],
+            }
+        )
+        return True  # silent for staff
+
+    token = reply.strip().upper()
+    # normalize tokens that may have extra text
+    for tname in (
+        "KEY_REQUEST",
+        "ESCALATE",
+        "PING_OWNER_PAYMENT",
+        "PING_MODS_BAN",
+        "BAN_WARN",
+    ):
+        if token == tname or token.startswith(tname):
+            token = tname
+            break
+
+    if token == "ESCALATE":
+        ai_log_entry(
+            {
+                "t": int(time.time()),
+                "uid": author.id,
+                "ch": message.channel.id,
+                "kind": "escalate",
+                "user": content[:200],
+            }
+        )
+        return True
+
+    if token == "KEY_REQUEST":
+        await post_key_request(message.guild, author, message.channel, content)
+        ai_bump(author.id)
+        ai_log_entry(
+            {
+                "t": int(time.time()),
+                "uid": author.id,
+                "ch": message.channel.id,
+                "kind": "key_request",
+                "user": content[:200],
+            }
+        )
+        return True
+
+    if token == "PING_OWNER_PAYMENT":
+        await message.channel.send(
+            f"<@{OWNER_PING}> {author.mention}\nPaid: {ticket_ai.PRICING_URL}"
+        )
+        ai_bump(author.id)
+        return True
+
+    if token == "PING_MODS_BAN":
+        await message.channel.send(
+            f"<@&{MOD_PING_ROLE}> ban report from {author.mention} (status working)."
+        )
+        ai_bump(author.id)
+        return True
+
+    if token == "BAN_WARN":
+        reply = (
+            "The script is currently vulnerable to automatic/manual bans. "
+            "This is on your side. You were warned."
+        )
+        await message.channel.send(reply)
+        ai_bump(author.id)
+        return True
+
+    if ticket_ai.looks_like_key(reply):
+        ai_log_entry(
+            {
+                "t": int(time.time()),
+                "uid": author.id,
+                "ch": message.channel.id,
+                "kind": "blocked_key_like",
+                "user": content[:200],
+                "reply": reply[:200],
+            }
+        )
+        return True
+
+    # inject pricing if paid mentioned and model forgot
+    out = reply[:900]
+    if ticket_ai.PAYMENT_KEYWORDS.search(content) and ticket_ai.PRICING_URL not in out:
+        out = out + f"\n{ticket_ai.PRICING_URL}"
+
+    try:
+        await message.channel.send(out)
+    except Exception as e:
+        print("[GH] ai send", e)
+    n = ai_bump(author.id)
+    ai_log_entry(
+        {
+            "t": int(time.time()),
+            "uid": author.id,
+            "ch": message.channel.id,
+            "kind": "reply",
+            "user": content[:200],
+            "reply": out[:300],
+            "n": n,
+        }
+    )
+    return True
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if not message.guild:
@@ -1374,6 +1834,13 @@ async def on_message(message: discord.Message):
             meta["close_at"] = int(time.time()) + 1800
             DATA["pending_tickets"][str(message.channel.id)] = meta
             save_data(DATA)
+
+    # ----- ticket AI -----
+    try:
+        if await handle_ticket_ai(message):
+            return
+    except Exception as e:
+        print(f"[GH] ticket_ai: {e}")
 
 
 @bot.event
@@ -2844,6 +3311,21 @@ async def cmd_stats(interaction: discord.Interaction):
     emb.add_field(name="Open tickets", value=str(len(DATA.get("pending_tickets") or {})), inline=True)
     emb.add_field(name="Keys", value="\n".join(key_lines)[:1000], inline=False)
     await interaction.followup.send(embed=emb, ephemeral=True)
+
+
+
+@bot.tree.command(name="ai_reset", description="Reset AI daily counter for a user (admin)")
+async def cmd_ai_reset(interaction: discord.Interaction, user: discord.Member):
+    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    DATA.setdefault("ai_daily", {}).setdefault(day, {})
+    DATA["ai_daily"][day][str(user.id)] = 0
+    save_data(DATA)
+    await interaction.response.send_message(
+        f"AI counter reset for {user.mention} (today).", ephemeral=True
+    )
 
 
 
