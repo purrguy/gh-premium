@@ -3051,10 +3051,9 @@ async def cmd_userinfo(interaction: discord.Interaction, member: discord.Member)
     # keys bound to this Discord user (API)
     key_lines: list[str] = []
     for path in (
-        f"/admin/keys/by-discord/{member.id}",
-        f"/admin/user/{member.id}/keys",
-        f"/api/discord/keys?discord_id={member.id}",
-        f"/admin/lookup?discord_id={member.id}",
+        f"/admin/keys-by-discord?discord_id={member.id}",
+        f"/admin/keys?discord_id={member.id}",
+        f"/admin/key/{member.id}",  # fallback if id-shaped key lookup ever used
     ):
         try:
             status, data = await api("GET", path)
