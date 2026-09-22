@@ -40,6 +40,7 @@ LICENSE_PANEL_CHANNEL_ID = int(os.getenv("LICENSE_PANEL_CHANNEL_ID", "0") or 0)
 VERIFY_CATEGORY_ID = int(os.getenv("VERIFY_CATEGORY_ID", "1453098727253479526"))
 VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "1445500571640402052"))
 FREE_REWIRE_ROLE_ID = int(os.getenv("FREE_REWIRE_ROLE_ID", "1545088955572158484"))
+PAID_ROLE_ID = int(os.getenv("PAID_ROLE_ID", "1551978825108291614"))
 QUARANTINE_ROLE_ID = int(os.getenv("QUARANTINE_ROLE_ID", "1545461244385828864"))
 MOD_ROLE_ID = int(os.getenv("MOD_ROLE_ID", "1445497065177088241"))
 WEBHOOKS_CHANNEL_ID = int(os.getenv("WEBHOOKS_CHANNEL_ID", "1546938830333153321"))
@@ -139,10 +140,7 @@ _default_data: dict[str, Any] = {
     "honeypot_kicks": 0,
     "honeypot_message_id": None,
     "giveaways": {},
-    "ai_daily": {},
-    "ai_logs": [],
-
-    "giveaways": {},
+    "free_rewire_given": [],  # discord ids who already received free rewire once
     "message_whitelist": [],
 }
 
@@ -521,13 +519,60 @@ async def ensure_no_unverified_if_member(member: discord.Member) -> None:
             pass
 
 
-async def ensure_free_rewire_role(member: discord.Member) -> None:
-    r = member.guild.get_role(FREE_REWIRE_ROLE_ID)
-    if r and r not in member.roles:
+
+async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True) -> bool:
+    """Defer interaction; ignore Unknown interaction (10062)."""
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+        return True
+    except discord.NotFound:
+        return False
+    except discord.HTTPException:
+        return False
+
+
+def can_rewire_member(m: discord.Member) -> bool:
+    """Staff always; others need free-rewire role."""
+    if is_mod(m) or is_admin(m) or is_owner(m):
+        return True
+    return FREE_REWIRE_ROLE_ID in _roles(m)
+
+
+def is_paid_plan(data: dict) -> bool:
+    plan = str(data.get("plan") or data.get("tier") or data.get("type") or "").lower()
+    if data.get("is_paid") or data.get("paid"):
+        return True
+    return any(x in plan for x in ("paid", "premium", "month", "year", "week", "lifetime", "pro"))
+
+
+async def grant_paid_role(member: discord.Member, data: dict) -> None:
+    if not is_paid_plan(data) or not member.guild:
+        return
+    role = member.guild.get_role(PAID_ROLE_ID)
+    if role and role not in member.roles:
         try:
-            await member.add_roles(r, reason="Free rewire")
+            await member.add_roles(role, reason="Paid key activated")
+        except Exception as e:
+            print(f"[GH] paid role: {e}")
+
+async def ensure_free_rewire_role(member: discord.Member) -> None:
+    """Give free-rewire role at most once per Discord user (first join). Never again."""
+    given = {int(x) for x in (DATA.get("free_rewire_given") or [])}
+    uid = int(member.id)
+    if uid in given:
+        return
+    r = member.guild.get_role(FREE_REWIRE_ROLE_ID)
+    if not r:
+        return
+    if r not in member.roles:
+        try:
+            await member.add_roles(r, reason="Free rewire (first join only)")
         except Exception:
-            pass
+            return
+    given.add(uid)
+    DATA["free_rewire_given"] = list(given)
+    save_data(DATA)
 
 
 async def open_ticket(
@@ -668,9 +713,13 @@ class LicenseVerifyModal(discord.ui.Modal, title="Activate license key"):
                 except Exception:
                     pass
         await ensure_no_unverified_if_member(interaction.user)
+        # free rewire only once ever (no-op if already granted)
         await ensure_free_rewire_role(interaction.user)
+        await grant_paid_role(interaction.user, data if isinstance(data, dict) else {})
+        plan_s = data.get("plan") if isinstance(data, dict) else None
         await interaction.followup.send(
-            f"**Key activated** · `{data.get('plan')}` · Roblox `{username}`",
+            f"**Key activated** · `{plan_s}` · Roblox `{username}`"
+            + (" · **Paid** role granted" if is_paid_plan(data if isinstance(data, dict) else {}) else ""),
             ephemeral=True,
         )
 
@@ -690,6 +739,13 @@ class LicenseRewireModal(discord.ui.Modal, title="Rewire key"):
         uname = str(self.roblox.value).strip()
         free_role = interaction.guild.get_role(FREE_REWIRE_ROLE_ID) if interaction.guild else None
         has_free = bool(free_role and free_role in interaction.user.roles)
+        if not can_rewire_member(interaction.user):
+            await interaction.followup.send(
+                "You need the **1 free rewire** role to rewire a key (any plan). "
+                "Staff can rewire without it.",
+                ephemeral=True,
+            )
+            return
         _, data = await api(
             "POST",
             "/api/discord/rewire",
@@ -1199,6 +1255,13 @@ async def refresh_honeypot_embed(guild: discord.Guild) -> None:
         return
     ch = guild.get_channel(HONEYPOT_CHANNEL_ID)
     if not isinstance(ch, discord.TextChannel):
+        try:
+            fetched = await bot.fetch_channel(HONEYPOT_CHANNEL_ID)
+            if isinstance(fetched, discord.TextChannel):
+                ch = fetched
+        except Exception:
+            ch = None
+    if not isinstance(ch, discord.TextChannel):
         print(f"[GH] honeypot channel missing: {HONEYPOT_CHANNEL_ID}")
         return
     mid = DATA.get("honeypot_message_id")
@@ -1605,6 +1668,9 @@ async def post_key_request(guild: discord.Guild, member: discord.Member, ticket_
 
 
 async def handle_ticket_ai(message: discord.Message) -> bool:
+    """AI removed — tickets are staff-only now."""
+    return False
+    # --- dead AI code below (kept for reference, unreachable) ---
     """Process AI for ticket channels. Return True if handled (caller may return)."""
     if False:
         return False
@@ -2603,19 +2669,44 @@ async def cmd_key(
     interaction: discord.Interaction,
     plan: app_commands.Choice[str],
     username: Optional[str] = None,
+    is_activated: bool = False,
+    days: Optional[int] = None,
 ):
+    """
+    is_activated: if True, key is ready to use immediately (pre-activated).
+    days: custom lifetime override (optional).
+    """
     if not isinstance(interaction.user, discord.Member) or not is_seller(interaction.user):
         await interaction.response.send_message("No permission.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
-    payload: dict[str, Any] = {"plan": plan.value}
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    payload: dict[str, Any] = {
+        "plan": plan.value,
+        "is_activated": bool(is_activated),
+        "activated": bool(is_activated),
+    }
     if username:
         payload["username"] = username.strip()
+    if days is not None:
+        d = max(1, min(int(days), 3650))
+        payload["days"] = d
+        payload["duration_days"] = d
     _, data = await api("POST", "/admin/generate", payload)
-    if not data.get("success"):
+    if not data.get("success") and not _api_ok(data):
         await interaction.followup.send(f"Fail: `{data}`", ephemeral=True)
         return
-    await interaction.followup.send(f"```{data.get('key')}``` plan `{data.get('plan')}`", ephemeral=True)
+    key_val = data.get("key") or data.get("license") or "?"
+    extra = []
+    if is_activated:
+        extra.append("pre-activated")
+    if days is not None:
+        extra.append(f"{int(days)}d")
+    extra_s = (" · " + ", ".join(extra)) if extra else ""
+    await interaction.followup.send(
+        f"```{key_val}``` plan `{data.get('plan') or plan.value}`{extra_s}",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="rewire", description="Rewire key")
@@ -2624,9 +2715,16 @@ async def cmd_rewire(interaction: discord.Interaction, key: str, username: str):
     if not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("Server only.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction, ephemeral=True):
+        return
     free_role = interaction.guild.get_role(FREE_REWIRE_ROLE_ID) if interaction.guild else None
     has_free = bool(free_role and free_role in interaction.user.roles)
+    if not can_rewire_member(interaction.user):
+        await interaction.followup.send(
+            "You need the **1 free rewire** role to rewire (any key). Staff bypass.",
+            ephemeral=True,
+        )
+        return
     _, data = await api(
         "POST",
         "/api/discord/rewire",
@@ -2802,7 +2900,9 @@ async def cmd_lookup_key(interaction: discord.Interaction, key: str):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
         await interaction.response.send_message("Admin only.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    
     key = key.strip()
     status, data = await api("GET", f"/admin/key/{key}")
     if status != 200:
@@ -2935,17 +3035,57 @@ async def cmd_say(interaction: discord.Interaction, channel: discord.TextChannel
         await interaction.followup.send(f"`{e}`", ephemeral=True)
 
 
-@bot.tree.command(name="userinfo", description="Show member roles / ids (admin)")
+@bot.tree.command(name="userinfo", description="Show member roles / ids / bound keys (admin)")
 async def cmd_userinfo(interaction: discord.Interaction, member: discord.Member):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
         await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    if not await safe_defer(interaction, ephemeral=True):
         return
     roles = ", ".join(r.mention for r in member.roles if r != interaction.guild.default_role)  # type: ignore
     emb = discord.Embed(title=str(member), color=0xD4AF37)
     emb.add_field(name="ID", value=str(member.id), inline=False)
     emb.add_field(name="Roles", value=roles[:1000] or "—", inline=False)
     emb.add_field(name="Joined", value=str(member.joined_at), inline=False)
-    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+    # keys bound to this Discord user (API)
+    key_lines: list[str] = []
+    for path in (
+        f"/admin/keys/by-discord/{member.id}",
+        f"/admin/user/{member.id}/keys",
+        f"/api/discord/keys?discord_id={member.id}",
+        f"/admin/lookup?discord_id={member.id}",
+    ):
+        try:
+            status, data = await api("GET", path)
+            if status != 200 or not isinstance(data, dict):
+                continue
+            keys = data.get("keys") or data.get("items") or data.get("data")
+            if isinstance(keys, list) and keys:
+                for k in keys[:25]:
+                    if isinstance(k, dict):
+                        key_lines.append(
+                            "`{key}` · {plan} · {user} · {exp}".format(
+                                key=str(k.get("key") or k.get("license") or "?")[:32],
+                                plan=k.get("plan") or k.get("tier") or "—",
+                                user=k.get("username") or k.get("roblox") or "—",
+                                exp=k.get("expires_at") or k.get("expires") or "—",
+                            )
+                        )
+                    else:
+                        key_lines.append(f"`{k}`")
+                break
+            if data.get("key"):
+                key_lines.append(f"`{data.get('key')}` · {data.get('plan') or '—'}")
+                break
+        except Exception:
+            continue
+    emb.add_field(
+        name="Bound keys",
+        value=("\n".join(key_lines)[:1000] if key_lines else "_none / API endpoint missing_"),
+        inline=False,
+    )
+    await interaction.followup.send(embed=emb, ephemeral=True)
 
 
 @bot.tree.command(name="whitelist", description="Key seller whitelist")
@@ -3271,6 +3411,29 @@ class GiveawayView(discord.ui.View):
         if time.time() > float(meta.get("ends_at", 0)):
             await interaction.response.send_message("This giveaway has ended.", ephemeral=True)
             return
+        # requirements
+        if isinstance(interaction.user, discord.Member):
+            req_role = int(meta.get("require_role_id") or 0)
+            if req_role and req_role not in {r.id for r in interaction.user.roles}:
+                await interaction.response.send_message(
+                    "Missing required role for this giveaway.", ephemeral=True
+                )
+                return
+            if meta.get("require_verified") and VERIFIED_ROLE_ID not in {
+                r.id for r in interaction.user.roles
+            }:
+                await interaction.response.send_message(
+                    "You must be **verified** to enter.", ephemeral=True
+                )
+                return
+            min_days = int(meta.get("min_account_days") or 0)
+            if min_days > 0 and interaction.user.created_at:
+                age_days = (discord.utils.utcnow() - interaction.user.created_at).days
+                if age_days < min_days:
+                    await interaction.response.send_message(
+                        f"Account must be at least **{min_days}** days old.", ephemeral=True
+                    )
+                    return
         entrants = set(meta.get("entrants") or [])
         uid = interaction.user.id
         if uid in entrants:
@@ -3329,6 +3492,9 @@ async def finish_giveaway(channel: discord.TextChannel, message_id: int) -> None
     duration_minutes="Duration in minutes (default 60)",
     winners="Number of winners (default 1)",
     channel="Channel to post (default current)",
+    require_role="Optional role required to enter",
+    require_verified="Must have verified/member role",
+    min_account_days="Minimum Discord account age in days",
 )
 async def cmd_giveaway(
     interaction: discord.Interaction,
@@ -3336,6 +3502,9 @@ async def cmd_giveaway(
     duration_minutes: int = 60,
     winners: int = 1,
     channel: Optional[discord.TextChannel] = None,
+    require_role: Optional[discord.Role] = None,
+    require_verified: bool = False,
+    min_account_days: int = 0,
 ):
     if not isinstance(interaction.user, discord.Member) or not (is_admin(interaction.user) or is_mod(interaction.user)):
         await interaction.response.send_message("Admin/mod only.", ephemeral=True)
@@ -3353,6 +3522,15 @@ async def cmd_giveaway(
     emb = discord.Embed(title="Giveaway", description=desc, color=0x9B59B6)
     emb.add_field(name="Winners", value=str(winners), inline=True)
     emb.add_field(name="Ends", value="<t:{}:R>".format(int(ends_at)), inline=True)
+    req_bits = []
+    if require_role:
+        req_bits.append(f"Role: {require_role.mention}")
+    if require_verified:
+        req_bits.append("Verified")
+    if min_account_days and min_account_days > 0:
+        req_bits.append(f"Account ≥ {min_account_days}d")
+    if req_bits:
+        emb.add_field(name="Requirements", value=" · ".join(req_bits), inline=False)
     emb.set_footer(text="Hosted by {}".format(interaction.user))
     view = GiveawayView()
     msg = await ch.send(embed=emb, view=view)
@@ -3424,7 +3602,9 @@ async def cmd_stats(interaction: discord.Interaction):
         await interaction.response.send_message(embed=emb)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    
     key_lines = []
     for path in ("/admin/stats", "/admin/keys/stats", "/api/admin/stats"):
         try:
@@ -3464,17 +3644,10 @@ async def cmd_stats(interaction: discord.Interaction):
 
 
 
-@bot.tree.command(name="ai_reset", description="Reset AI daily counter for a user (admin)")
+@bot.tree.command(name="ai_reset", description="(disabled) AI was removed")
 async def cmd_ai_reset(interaction: discord.Interaction, user: discord.Member):
-    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
-        return
-    day = time.strftime("%Y-%m-%d", time.gmtime())
-    DATA.setdefault("ai_daily", {}).setdefault(day, {})
-    DATA["ai_daily"][day][str(user.id)] = 0
-    save_data(DATA)
     await interaction.response.send_message(
-        f"AI counter reset for {user.mention} (today).", ephemeral=True
+        "Ticket AI is **disabled**. Staff handle tickets manually.", ephemeral=True
     )
 
 
