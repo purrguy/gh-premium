@@ -732,6 +732,9 @@ class LicenseResetHwidModal(discord.ui.Modal, title="Reset HWID"):
         if not isinstance(interaction.user, discord.Member):
             await interaction.followup.send("Server only.", ephemeral=True)
             return
+        ok_oauth, _ = await require_oauth(interaction)
+        if not ok_oauth:
+            return
         _, data = await api(
             "POST",
             "/admin/reset-hwid",
@@ -742,6 +745,11 @@ class LicenseResetHwidModal(discord.ui.Modal, title="Reset HWID"):
             if reason == "reset_cooldown" and isinstance(data, dict) and data.get("reset_available_at"):
                 await interaction.followup.send(
                     f"Cooldown: next reset <t:{int(data['reset_available_at'])}:R>",
+                    ephemeral=True,
+                )
+            elif reason == "free_used":
+                await interaction.followup.send(
+                    "Free keys get 1 HWID reset. Paid keys reset every 7 days.",
                     ephemeral=True,
                 )
             else:
@@ -790,6 +798,16 @@ class LicensePanelView(discord.ui.View):
 
     @discord.ui.button(label="Reset HWID", style=discord.ButtonStyle.primary, custom_id="cl:lic:r", row=0)
     async def r(self, interaction: discord.Interaction, button: discord.ui.Button):
+        st = await fetch_oauth_status(interaction.user.id)
+        if not st.get("authorized"):
+            await interaction.response.send_message(
+                "**Authorize the bot first** before reset.",
+                view=oauth_authorize_view(interaction.user.id),
+                ephemeral=True,
+            )
+            return
+        if isinstance(interaction.user, discord.Member):
+            await grant_oauth_roles(interaction.user, st.get("guild_ids") or [])
         await interaction.response.send_modal(LicenseResetHwidModal())
 
     @discord.ui.button(label="Help ticket", style=discord.ButtonStyle.secondary, custom_id="cl:lic:ticket", row=0)
@@ -2679,6 +2697,9 @@ async def cmd_reset_hwid(interaction: discord.Interaction, key: str):
     if not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("Server only.", ephemeral=True)
         return
+    ok_oauth, _ = await require_oauth(interaction)
+    if not ok_oauth:
+        return
     if not await safe_defer(interaction, ephemeral=True):
         return
     _, data = await api(
@@ -2693,6 +2714,11 @@ async def cmd_reset_hwid(interaction: discord.Interaction, key: str):
                 f"Cooldown: next reset <t:{int(data['reset_available_at'])}:R>",
                 ephemeral=True,
             )
+        elif reason == "free_used":
+            await interaction.followup.send(
+                "Free keys get 1 HWID reset. Paid keys reset every 7 days.",
+                ephemeral=True,
+            )
         else:
             await interaction.followup.send(f"Fail: `{data}`", ephemeral=True)
         return
@@ -2700,6 +2726,9 @@ async def cmd_reset_hwid(interaction: discord.Interaction, key: str):
         await interaction.followup.send("Key has no HWID bind.", ephemeral=True)
         return
     await interaction.followup.send("HWID reset. Re-execute the script to bind the new machine.", ephemeral=True)
+
+
+@bot.tree.command(name="renew", description="Renew key (admin)")
 
 
 @bot.tree.command(name="renew", description="Renew key (admin)")
@@ -3178,6 +3207,56 @@ async def cmd_kick(
     ok = _api_ok(data) or data.get("success")
     await interaction.followup.send(
         f"Kick queued for `{uid}`" + (f" ({username})" if username else "") + "."
+        if ok
+        else f"Fail: `{data}`",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="message", description="Queue game popup for key / discord user / roblox id (mod)")
+@app_commands.describe(
+    text="Popup text shown in game",
+    key="License key (optional if user given)",
+    user="Discord member the key is bound to (optional)",
+    user_id="Roblox user id (optional)",
+)
+async def cmd_message(
+    interaction: discord.Interaction,
+    text: str,
+    key: str = "",
+    user: discord.Member | None = None,
+    user_id: str = "",
+):
+    if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
+        await interaction.response.send_message("Mod only.", ephemeral=True)
+        return
+    text = (text or "").strip()[:300]
+    if not text:
+        await interaction.response.send_message("Need text.", ephemeral=True)
+        return
+    payload: dict = {"text": text}
+    if key.strip():
+        payload["key"] = key.strip()
+    if user is not None:
+        payload["discord_id"] = str(user.id)
+    uid = "".join(c for c in (user_id or "") if c.isdigit())
+    if uid:
+        payload["user_id"] = uid
+    if not payload.get("key") and not payload.get("discord_id") and not payload.get("user_id"):
+        # resolve key by discord member via keys-by-discord
+        if user is not None:
+            _, found = await api("GET", f"/admin/keys-by-discord?discord_id={user.id}")
+            keys = (found.get("keys") or []) if isinstance(found, dict) else []
+            if keys and keys[0].get("key"):
+                payload["key"] = keys[0]["key"]
+        if not payload.get("key"):
+            await interaction.response.send_message("Need key, user, or user_id.", ephemeral=True)
+            return
+    await interaction.response.defer(ephemeral=True)
+    _, data = await api("POST", "/admin/message", payload)
+    ok = _api_ok(data) or (isinstance(data, dict) and data.get("success"))
+    await interaction.followup.send(
+        f"Popup queued#{data.get('id') if isinstance(data, dict) else '?'}."
         if ok
         else f"Fail: `{data}`",
         ephemeral=True,
