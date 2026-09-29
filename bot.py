@@ -724,63 +724,37 @@ class LicenseVerifyModal(discord.ui.Modal, title="Activate license key"):
         )
 
 
-class LicenseRewireModal(discord.ui.Modal, title="Rewire key"):
+class LicenseResetHwidModal(discord.ui.Modal, title="Reset HWID"):
     key = discord.ui.TextInput(label="License key", min_length=8, max_length=64, required=True)
-    roblox = discord.ui.TextInput(label="New Roblox username", min_length=3, max_length=20, required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         if not isinstance(interaction.user, discord.Member):
             await interaction.followup.send("Server only.", ephemeral=True)
             return
-        ok_oauth, _ = await require_oauth(interaction)
-        if not ok_oauth:
-            return
-        uname = str(self.roblox.value).strip()
-        free_role = interaction.guild.get_role(FREE_REWIRE_ROLE_ID) if interaction.guild else None
-        has_free = bool(free_role and free_role in interaction.user.roles)
-        if not can_rewire_member(interaction.user):
-            await interaction.followup.send(
-                "You need the **1 free rewire** role to rewire a key (any plan). "
-                "Staff can rewire without it.",
-                ephemeral=True,
-            )
-            return
         _, data = await api(
             "POST",
-            "/api/discord/rewire",
-            {
-                "key": str(self.key.value).strip(),
-                "username": uname,
-                "roblox_username": uname,
-                "discord_id": str(interaction.user.id),
-                "free_rewire": has_free,
-            },
+            "/admin/reset-hwid",
+            {"key": str(self.key.value).strip()},
         )
-        if not _api_ok(data) and has_free:
-            _, data = await api(
-                "POST",
-                "/admin/rewire",
-                {
-                    "key": str(self.key.value).strip(),
-                    "username": uname,
-                    "discord_id": str(interaction.user.id),
-                    "force": True,
-                },
-            )
         if not _api_ok(data) and not data.get("success"):
-            await interaction.followup.send(
-                f"Rewire failed: `{data.get('error') or data.get('reason') or data}`",
-                ephemeral=True,
-            )
+            reason = data.get("reason") if isinstance(data, dict) else None
+            if reason == "reset_cooldown" and isinstance(data, dict) and data.get("reset_available_at"):
+                await interaction.followup.send(
+                    f"Cooldown: next reset <t:{int(data['reset_available_at'])}:R>",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"Reset failed: `{data.get('error') or data.get('reason') or data}`",
+                    ephemeral=True,
+                )
             return
-        if has_free and free_role:
-            try:
-                await interaction.user.remove_roles(free_role, reason="Used free rewire")
-            except Exception:
-                pass
+        if isinstance(data, dict) and data.get("already_free"):
+            await interaction.followup.send("Key has no HWID bind.", ephemeral=True)
+            return
         await interaction.followup.send(
-            f"**Rewired** → `{uname}`" + (" · free rewire used" if has_free else ""),
+            "HWID reset. Re-execute the script to bind the new machine.",
             ephemeral=True,
         )
 
@@ -814,19 +788,9 @@ class LicensePanelView(discord.ui.View):
         await grant_oauth_roles(interaction.user, st.get("guild_ids") or [])
         await interaction.response.send_modal(LicenseVerifyModal())
 
-    @discord.ui.button(label="Rewire", style=discord.ButtonStyle.primary, custom_id="cl:lic:r", row=0)
+    @discord.ui.button(label="Reset HWID", style=discord.ButtonStyle.primary, custom_id="cl:lic:r", row=0)
     async def r(self, interaction: discord.Interaction, button: discord.ui.Button):
-        st = await fetch_oauth_status(interaction.user.id)
-        if not st.get("authorized"):
-            await interaction.response.send_message(
-                "**Authorize the bot first** before rewire.",
-                view=oauth_authorize_view(interaction.user.id),
-                ephemeral=True,
-            )
-            return
-        if isinstance(interaction.user, discord.Member):
-            await grant_oauth_roles(interaction.user, st.get("guild_ids") or [])
-        await interaction.response.send_modal(LicenseRewireModal())
+        await interaction.response.send_modal(LicenseResetHwidModal())
 
     @discord.ui.button(label="Help ticket", style=discord.ButtonStyle.secondary, custom_id="cl:lic:ticket", row=0)
     async def ticket_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2709,47 +2673,33 @@ async def cmd_key(
     )
 
 
-@bot.tree.command(name="rewire", description="Rewire key")
-@app_commands.describe(key="key", username="new roblox name")
-async def cmd_rewire(interaction: discord.Interaction, key: str, username: str):
+@bot.tree.command(name="reset-hwid", description="Reset HWID bind (once per 7 days)")
+@app_commands.describe(key="key")
+async def cmd_reset_hwid(interaction: discord.Interaction, key: str):
     if not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("Server only.", ephemeral=True)
         return
     if not await safe_defer(interaction, ephemeral=True):
         return
-    free_role = interaction.guild.get_role(FREE_REWIRE_ROLE_ID) if interaction.guild else None
-    has_free = bool(free_role and free_role in interaction.user.roles)
-    if not can_rewire_member(interaction.user):
-        await interaction.followup.send(
-            "You need the **1 free rewire** role to rewire (any key). Staff bypass.",
-            ephemeral=True,
-        )
-        return
     _, data = await api(
         "POST",
-        "/api/discord/rewire",
-        {
-            "key": key.strip(),
-            "username": username.strip(),
-            "discord_id": str(interaction.user.id),
-            "free_rewire": has_free,
-        },
+        "/admin/reset-hwid",
+        {"key": key.strip()},
     )
-    if not _api_ok(data) and has_free:
-        _, data = await api(
-            "POST",
-            "/admin/rewire",
-            {"key": key.strip(), "username": username.strip(), "force": True},
-        )
     if not _api_ok(data) and not data.get("success"):
-        await interaction.followup.send(f"Fail: `{data}`", ephemeral=True)
+        reason = data.get("reason") if isinstance(data, dict) else None
+        if reason == "reset_cooldown" and isinstance(data, dict) and data.get("reset_available_at"):
+            await interaction.followup.send(
+                f"Cooldown: next reset <t:{int(data['reset_available_at'])}:R>",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(f"Fail: `{data}`", ephemeral=True)
         return
-    if has_free and free_role:
-        try:
-            await interaction.user.remove_roles(free_role)
-        except Exception:
-            pass
-    await interaction.followup.send(f"Rewired → `{username}`", ephemeral=True)
+    if isinstance(data, dict) and data.get("already_free"):
+        await interaction.followup.send("Key has no HWID bind.", ephemeral=True)
+        return
+    await interaction.followup.send("HWID reset. Re-execute the script to bind the new machine.", ephemeral=True)
 
 
 @bot.tree.command(name="renew", description="Renew key (admin)")
