@@ -2785,9 +2785,6 @@ async def cmd_reset_hwid(interaction: discord.Interaction, key: str):
 
 
 @bot.tree.command(name="renew", description="Renew key (admin)")
-
-
-@bot.tree.command(name="renew", description="Renew key (admin)")
 async def cmd_renew(interaction: discord.Interaction, key: str, days: app_commands.Range[int, 1, 365]):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
         await interaction.response.send_message("Admin only.", ephemeral=True)
