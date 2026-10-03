@@ -142,6 +142,7 @@ _default_data: dict[str, Any] = {
     "giveaways": {},
     "free_rewire_given": [],  # discord ids who already received free rewire once
     "message_whitelist": [],
+    "autoreplies": {},  # keyword-lower -> answer text (admin managed)
 }
 
 
@@ -1047,6 +1048,54 @@ class ServerVerifyView(discord.ui.View):
             return
         await grant_oauth_roles(interaction.user, st.get("guild_ids") or [])
         await interaction.response.send_modal(LicenseVerifyModal())
+
+
+# ----- Keyword autoreplies -----
+# DATA["autoreplies"]: {keyword-lower: answer}. Word-boundary match,
+# case-insensitive. One reply per user per cooldown window.
+AUTOREPLY_COOLDOWN = 60  # seconds, per user (shared across keywords)
+_ar_cooldowns: dict[int, float] = {}
+
+
+def _ar_get_map() -> dict[str, str]:
+    m = DATA.get("autoreplies")
+    return m if isinstance(m, dict) else {}
+
+
+async def handle_autoreply(message: discord.Message) -> bool:
+    """Reply once if a keyword matches. Returns True when handled."""
+    if not isinstance(message.author, discord.Member):
+        return False
+    text = (message.content or "").strip()
+    if not text:
+        return False
+    # never hijack command invocations
+    if text[0] in "/!?.<>@#":
+        return False
+    mapping = _ar_get_map()
+    if not mapping:
+        return False
+    low = text.lower()
+    hit = None
+    for kw in mapping:
+        k = (kw or "").strip().lower()
+        if not k:
+            continue
+        if re.search(r"(?i)(?<![A-Za-z0-9_])" + re.escape(k) + r"(?![A-Za-z0-9_])", text):
+            hit = k
+            break
+    if hit is None:
+        return False
+    now = time.time()
+    last = _ar_cooldowns.get(message.author.id, 0.0)
+    if now - last < AUTOREPLY_COOLDOWN:
+        return True  # swallow quietly: already answered recently
+    _ar_cooldowns[message.author.id] = now
+    try:
+        await message.reply(mapping[hit], mention_author=False)
+    except Exception as e:
+        print(f"[GH] autoreply send: {e}")
+    return True
 
 
 # ----- Events -----
@@ -2025,6 +2074,13 @@ async def on_message(message: discord.Message):
                 asyncio.create_task(_delete_verify_reply(reply_msg))
             return
 
+    # ----- keyword autoreplies (admin managed via /autoreply) -----
+    try:
+        if await handle_autoreply(message):
+            return
+    except Exception as e:
+        print(f"[GH] autoreply: {e}")
+
     # ----- ticket close timer: any message resets 30 min countdown -----
     if isinstance(message.channel, discord.TextChannel):
         meta = (DATA.get("pending_tickets") or {}).get(str(message.channel.id))
@@ -2898,6 +2954,67 @@ async def cmd_lookup_key(interaction: discord.Interaction, key: str):
     )
 
 
+
+
+@bot.tree.command(name="autoreply", description="Add/update a keyword autoreply (admin)")
+@app_commands.describe(keyword="Word that triggers the reply", answer="What the bot sends back")
+async def cmd_autoreply(interaction: discord.Interaction, keyword: str, answer: str):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    kw = (keyword or "").strip().lower()
+    ans = (answer or "").strip()
+    if len(kw) < 2 or len(kw) > 64:
+        await interaction.response.send_message("Keyword must be 2-64 characters.", ephemeral=True)
+        return
+    if not ans or len(ans) > 1500:
+        await interaction.response.send_message("Answer must be 1-1500 characters.", ephemeral=True)
+        return
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    mapping = _ar_get_map()
+    is_new = kw not in mapping
+    mapping[kw] = ans
+    DATA["autoreplies"] = mapping
+    save_data(DATA)
+    await interaction.followup.send(
+        f"✅ Autoreply **{'added' if is_new else 'updated'}**: `{kw}` →\n{ans[:1500]}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="autoreply-remove", description="Delete a keyword autoreply (admin)")
+@app_commands.describe(keyword="Keyword to stop replying to")
+async def cmd_autoreply_remove(interaction: discord.Interaction, keyword: str):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    kw = (keyword or "").strip().lower()
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    mapping = _ar_get_map()
+    if kw not in mapping:
+        await interaction.followup.send(f"No autoreply for `{kw}`.", ephemeral=True)
+        return
+    del mapping[kw]
+    DATA["autoreplies"] = mapping
+    save_data(DATA)
+    await interaction.followup.send(f"🗑️ Autoreply for `{kw}` deleted.", ephemeral=True)
+
+
+@bot.tree.command(name="autoreply-list", description="List keyword autoreplies (admin)")
+async def cmd_autoreply_list(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    mapping = _ar_get_map()
+    if not mapping:
+        await interaction.followup.send("No autoreplies set. Add one with `/autoreply`.", ephemeral=True)
+        return
+    lines = [f"• `{k}` → {v[:90]}{'…' if len(v) > 90 else ''}" for k, v in sorted(mapping.items())]
+    await interaction.followup.send("**Autoreplies**\n" + "\n".join(lines)[:1800], ephemeral=True)
 
 
 @bot.tree.command(name="honeypot_setup", description="Post/refresh honeypot embed (admin)")
