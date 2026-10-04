@@ -673,58 +673,6 @@ async def open_verify_ticket_only(member: discord.Member) -> dict[str, Any]:
 
 
 # ----- License UI -----
-class LicenseVerifyModal(discord.ui.Modal, title="Activate license key"):
-    key = discord.ui.TextInput(label="License key", min_length=8, max_length=64, required=True)
-    roblox = discord.ui.TextInput(label="Roblox username", min_length=3, max_length=20, required=True)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        if not isinstance(interaction.user, discord.Member):
-            await interaction.followup.send("Server only.", ephemeral=True)
-            return
-        ok_oauth, _ = await require_oauth(interaction)
-        if not ok_oauth:
-            return
-        username = str(self.roblox.value).strip()
-        if not re.match(r"^[A-Za-z0-9_]+$", username):
-            await interaction.followup.send("Invalid Roblox username.", ephemeral=True)
-            return
-        _, data = await api(
-            "POST",
-            "/api/discord/verify-key",
-            {
-                "key": str(self.key.value).strip(),
-                "username": username,
-                "roblox_username": username,
-                "discord_id": str(interaction.user.id),
-            },
-        )
-        if not _api_ok(data):
-            await interaction.followup.send(
-                f"Failed: `{data.get('error') or data.get('reason') or data}`",
-                ephemeral=True,
-            )
-            return
-        # Grant Member after successful key activation
-        if interaction.guild:
-            vrole = interaction.guild.get_role(VERIFIED_ROLE_ID)
-            if vrole and vrole not in interaction.user.roles:
-                try:
-                    await interaction.user.add_roles(vrole, reason="Key activated")
-                except Exception:
-                    pass
-        await ensure_no_unverified_if_member(interaction.user)
-        # free rewire only once ever (no-op if already granted)
-        await ensure_free_rewire_role(interaction.user)
-        await grant_paid_role(interaction.user, data if isinstance(data, dict) else {})
-        plan_s = data.get("plan") if isinstance(data, dict) else None
-        await interaction.followup.send(
-            f"**Key activated** · `{plan_s}` · Roblox `{username}`"
-            + (" · **Paid** role granted" if is_paid_plan(data if isinstance(data, dict) else {}) else ""),
-            ephemeral=True,
-        )
-
-
 class LicenseResetHwidModal(discord.ui.Modal, title="Reset HWID"):
     key = discord.ui.TextInput(label="License key", min_length=8, max_length=64, required=True)
 
@@ -772,30 +720,6 @@ class LicensePanelView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(label="Get free key", style=discord.ButtonStyle.link, url=KEY_LINK, row=1))
-
-    @discord.ui.button(label="Activate key", style=discord.ButtonStyle.primary, custom_id="cl:lic:verify", row=0, emoji="🔑")
-    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """
-        One button:
-        - not OAuth authorized → Discord authorize link
-        - authorized → open key activation modal
-        """
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Use in a server.", ephemeral=True)
-            return
-        st = await fetch_oauth_status(interaction.user.id)
-        if not st.get("authorized"):
-            await interaction.response.send_message(
-                "**Authorize the bot first.**\n"
-                "1. Click the button below\n"
-                "2. Accept **identify** + **guilds**\n"
-                "3. Return here and press **Activate key** again to enter your key",
-                view=oauth_authorize_view(interaction.user.id),
-                ephemeral=True,
-            )
-            return
-        await grant_oauth_roles(interaction.user, st.get("guild_ids") or [])
-        await interaction.response.send_modal(LicenseVerifyModal())
 
     @discord.ui.button(label="Reset HWID", style=discord.ButtonStyle.primary, custom_id="cl:lic:r", row=0)
     async def r(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1006,7 +930,7 @@ def license_embed() -> discord.Embed:
     return discord.Embed(
         title="Dashboard ⚙️",
         description=(
-            "**🔑 Activate key** — authorize bot (first time) or activate key\n"
+            "**Member** — authorize bot (first time) to get the Member role\n"
             "**Rewire** — move key to another Roblox account\n"
             "**Help ticket** — staff ticket only (no auto roles)\n"
             f"**Get free key** — {KEY_LINK}"
@@ -1047,7 +971,7 @@ class ServerVerifyView(discord.ui.View):
             )
             return
         await grant_oauth_roles(interaction.user, st.get("guild_ids") or [])
-        await interaction.response.send_modal(LicenseVerifyModal())
+        await interaction.response.send_message("Verified — Member role granted.", ephemeral=True)
 
 
 # ----- Keyword autoreplies -----
@@ -2052,7 +1976,7 @@ async def on_message(message: discord.Message):
                     f"{message.author.mention} **Verify / authorize the bot**\n"
                     "1. Open the link (**identify** + **guilds**)\n"
                     "2. After **Connected**, roles are granted automatically (~30s)\n"
-                    "3. Then use **🔑 Activate key** on the license panel",
+                    "3. Roles are granted automatically — no key needed (script is free)",
                     view=oauth_authorize_view(message.author.id),
                     mention_author=True,
                 )
@@ -2694,7 +2618,7 @@ async def cmd_license_panel(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="key", description="Generate key (seller/admin)")
-@app_commands.describe(plan="plan", username="optional bind")
+@app_commands.describe(plan="plan", username="optional bind", testing="testing key (loads testing build)")
 @app_commands.choices(
     plan=[
         app_commands.Choice(name="day", value="day"),
@@ -2707,11 +2631,11 @@ async def cmd_key(
     interaction: discord.Interaction,
     plan: app_commands.Choice[str],
     username: Optional[str] = None,
-    is_activated: bool = False,
+    testing: bool = False,
     days: Optional[int] = None,
 ):
     """
-    is_activated: if True, key is ready to use immediately (pre-activated).
+    testing: if True, generates a long testing key (loads the testing build).
     days: custom lifetime override (optional).
     """
     if not isinstance(interaction.user, discord.Member) or not is_seller(interaction.user):
@@ -2721,8 +2645,7 @@ async def cmd_key(
         return
     payload: dict[str, Any] = {
         "plan": plan.value,
-        "is_activated": bool(is_activated),
-        "activated": bool(is_activated),
+        "testing": bool(testing),
     }
     if username:
         payload["username"] = username.strip()
@@ -2736,8 +2659,8 @@ async def cmd_key(
         return
     key_val = data.get("key") or data.get("license") or "?"
     extra = []
-    if is_activated:
-        extra.append("pre-activated")
+    if testing or data.get("testing"):
+        extra.append("TESTING (loads testing build)")
     if days is not None:
         extra.append(f"{int(days)}d")
     extra_s = (" · " + ", ".join(extra)) if extra else ""
@@ -3223,7 +3146,7 @@ async def cmd_whitelist(
 async def cmd_verify(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message(
-            "Authorize the bot (identify + guilds), then use **Activate key** on the license panel.",
+            "Authorize the bot (identify + guilds) to get the Member role. The script is free — no key needed.",
             view=oauth_authorize_view(interaction.user.id),
             ephemeral=True,
         )
