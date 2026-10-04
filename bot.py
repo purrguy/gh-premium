@@ -2283,9 +2283,9 @@ async def _bt():
 
 
 # ----- Commands -----
-@bot.tree.command(name="message", description="Send as bot (whitelist)")
+@bot.tree.command(name="send", description="Send as bot (whitelist)")
 @app_commands.describe(channel="Channel", text="Text")
-async def cmd_message(interaction: discord.Interaction, channel: discord.TextChannel, text: str):
+async def cmd_send(interaction: discord.Interaction, channel: discord.TextChannel, text: str):
     if not can_message_cmd(interaction.user):
         await interaction.response.send_message("No permission.", ephemeral=True)
         return
