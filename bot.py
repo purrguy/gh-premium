@@ -2743,6 +2743,36 @@ async def cmd_status(interaction: discord.Interaction, state: app_commands.Choic
     await interaction.response.send_message(f"→ {STATUS_MAP[state.value]}", ephemeral=True)
 
 
+@bot.tree.command(name="add-obf", description="Grant bonus obfuscations to a license key (admin)")
+@app_commands.describe(key="License key (GH-XXXX-XXXX-XXXX)", amount="How many extra obfuscations",
+                       duration="How long the bonus lasts")
+@app_commands.choices(duration=[
+    app_commands.Choice(name="today only", value="today"),
+    app_commands.Choice(name="forever", value="forever"),
+])
+async def cmd_add_obf(interaction: discord.Interaction, key: str, amount: int,
+                      duration: app_commands.Choice[str]):
+    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    if amount < 1 or amount > 10000:
+        await interaction.response.send_message("Amount must be 1-10000.", ephemeral=True)
+        return
+    if not await safe_defer(interaction, ephemeral=True):
+        return
+    days = 0 if duration.value == "forever" else 1
+    status, data = await api("POST", "/admin/obf-grant",
+                             {"license_key": key.strip(), "amount": amount, "days": days})
+    if status != 200 or not (data or {}).get("ok"):
+        await interaction.followup.send(
+            f"Grant failed: `{(data or {}).get('error', status)}`", ephemeral=True)
+        return
+    exp = "never expires" if not data.get("expires_at") else f"expires <t:{data['expires_at']}:R>"
+    await interaction.followup.send(
+        f"✅ Added **{amount}** obfuscations to `{key.strip()}` ({exp}).",
+        ephemeral=True)
+
+
 # ----- Moderation helpers -----
 
 @bot.tree.command(name="quarantine", description="Quarantine member: strip managed roles, add quarantine role")
