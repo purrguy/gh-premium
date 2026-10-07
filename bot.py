@@ -2618,7 +2618,7 @@ async def cmd_license_panel(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="key", description="Generate key (seller/admin)")
-@app_commands.describe(plan="plan", username="optional bind", testing="testing key (loads testing build)")
+@app_commands.describe(plan="plan", username="optional bind", testing="testing key (loads testing build)", custom="literal key string (8-64 chars, A-Z a-z 0-9 _ -)", universal="works on all HWIDs (default off)")
 @app_commands.choices(
     plan=[
         app_commands.Choice(name="day", value="day"),
@@ -2633,10 +2633,14 @@ async def cmd_key(
     username: Optional[str] = None,
     testing: bool = False,
     days: Optional[int] = None,
+    custom: Optional[str] = None,
+    universal: bool = False,
 ):
     """
     testing: if True, generates a long testing key (loads the testing build).
     days: custom lifetime override (optional).
+    custom: seller types the exact key string (worker enforces uniqueness).
+    universal: if True, the key works on all HWIDs (no machine bind).
     """
     if not isinstance(interaction.user, discord.Member) or not is_seller(interaction.user):
         await interaction.response.send_message("No permission.", ephemeral=True)
@@ -2653,14 +2657,29 @@ async def cmd_key(
         d = max(1, min(int(days), 3650))
         payload["days"] = d
         payload["duration_days"] = d
+    if custom and custom.strip():
+        payload["custom_key"] = custom.strip()
+    if universal:
+        payload["hwid_free"] = True
     _, data = await api("POST", "/admin/generate", payload)
     if not data.get("success") and not _api_ok(data):
+        reason = data.get("reason") if isinstance(data, dict) else None
+        if reason == "duplicate":
+            await interaction.followup.send("That custom key string is already taken — pick another.", ephemeral=True)
+            return
+        if reason == "invalid_custom_key":
+            await interaction.followup.send("Custom key must be 8-64 chars: letters, digits, `_`, `-`.", ephemeral=True)
+            return
         await interaction.followup.send(f"Fail: `{data}`", ephemeral=True)
         return
     key_val = data.get("key") or data.get("license") or "?"
     extra = []
     if testing or data.get("testing"):
         extra.append("TESTING (loads testing build)")
+    if data.get("custom"):
+        extra.append("CUSTOM")
+    if data.get("hwid_free"):
+        extra.append("UNIVERSAL (all HWIDs)")
     if days is not None:
         extra.append(f"{int(days)}d")
     extra_s = (" · " + ", ".join(extra)) if extra else ""
