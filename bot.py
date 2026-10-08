@@ -3225,11 +3225,12 @@ async def cmd_verify(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="ban", description="Ban key and/or Roblox username/userId from GH")
+@bot.tree.command(name="ban", description="Ban key / Roblox user / HWID from GH")
 @app_commands.describe(
     key="License key",
     username="Roblox username",
     user_id="Roblox user id (queues kick)",
+    hwid="Machine HWID (full or 8+ char prefix from logs; bans whole device)",
     reason="Reason",
 )
 async def cmd_ban(
@@ -3237,14 +3238,19 @@ async def cmd_ban(
     key: str = "",
     username: str = "",
     user_id: str = "",
+    hwid: str = "",
     reason: str = "",
 ):
     if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
         await interaction.response.send_message("Mod only.", ephemeral=True)
         return
     uid = "".join(c for c in (user_id or "") if c.isdigit())
-    if not key.strip() and not username.strip() and not uid:
-        await interaction.response.send_message("Need key, username, and/or user_id.", ephemeral=True)
+    hw = (hwid or "").strip()
+    if not key.strip() and not username.strip() and not uid and not hw:
+        await interaction.response.send_message("Need key, username, user_id, and/or hwid.", ephemeral=True)
+        return
+    if hw and len(hw) < 8:
+        await interaction.response.send_message("HWID needs 8+ chars (paste full or the prefix from logs).", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     payload = {
@@ -3255,13 +3261,23 @@ async def cmd_ban(
     }
     if uid:
         payload["user_id"] = uid
+    if hw:
+        payload["hwid"] = hw
     _, data = await api("POST", "/admin/ban", payload)
     ok = _api_ok(data) or data.get("success")
-    extra = " (+ kick queued)" if uid and ok else ""
-    await interaction.followup.send(
-        ("Banned." + extra) if ok else f"Fail: `{data}`",
-        ephemeral=True,
-    )
+    if not ok:
+        await interaction.followup.send(f"Fail: `{data}`", ephemeral=True)
+        return
+    bits = []
+    if isinstance(data, dict):
+        if data.get("keys_revoked"):
+            bits.append(f"keys revoked: {data['keys_revoked']}")
+        if data.get("kicks_queued"):
+            bits.append(f"kicks queued: {data['kicks_queued']}")
+        elif uid:
+            bits.append("kick queued")
+    extra = (" (" + ", ".join(bits) + ")") if bits else ""
+    await interaction.followup.send(f"Banned.{extra}", ephemeral=True)
 
 
 @bot.tree.command(name="kick", description="Queue client kick for Roblox userId (mod)")
@@ -3349,14 +3365,14 @@ async def cmd_message(
     )
 
 
-@bot.tree.command(name="unban", description="Remove GH ban by key and/or username")
-@app_commands.describe(key="License key", username="Roblox username")
-async def cmd_unban(interaction: discord.Interaction, key: str = "", username: str = ""):
+@bot.tree.command(name="unban", description="Remove GH ban by key / username / HWID")
+@app_commands.describe(key="License key", username="Roblox username", hwid="Machine HWID (full or prefix)")
+async def cmd_unban(interaction: discord.Interaction, key: str = "", username: str = "", hwid: str = ""):
     if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
         await interaction.response.send_message("Mod only.", ephemeral=True)
         return
-    if not key.strip() and not username.strip():
-        await interaction.response.send_message("Need key and/or username.", ephemeral=True)
+    if not key.strip() and not username.strip() and not hwid.strip():
+        await interaction.response.send_message("Need key, username, and/or hwid.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     _, data = await api(
@@ -3365,6 +3381,7 @@ async def cmd_unban(interaction: discord.Interaction, key: str = "", username: s
         {
             "key": key.strip(),
             "username": username.strip(),
+            "hwid": hwid.strip(),
             "by_discord": str(interaction.user.id),
         },
     )
