@@ -2844,6 +2844,38 @@ async def cmd_quarantine(
     )
 
 
+@bot.tree.command(name="ban", description="Ban a member (admin)")
+@app_commands.describe(member="User to ban", reason="Reason", delete_days="Delete message history days (0-7)")
+async def cmd_ban(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: Optional[str] = None,
+    delete_days: int = 0,
+):
+    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if is_owner(member):
+        await interaction.followup.send("Cannot ban an owner.", ephemeral=True)
+        return
+    guild = interaction.guild
+    if guild is None:
+        return
+    if not _bot_can_manage_role(guild, member.top_role):
+        await interaction.followup.send("Bot role must be above the target's top role.", ephemeral=True)
+        return
+    dd = max(0, min(7, int(delete_days or 0)))
+    try:
+        await member.ban(reason=f"{interaction.user}: {reason or 'n/a'}", delete_message_days=dd)
+    except Exception as e:
+        await interaction.followup.send(f"Ban failed: `{e}`", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"🔨 {member.mention} banned." + (f"\\nReason: {reason}" if reason else ""),
+        ephemeral=True,
+    )
+
 @bot.tree.command(name="unquarantine", description="Remove quarantine role")
 @app_commands.describe(member="User", give_unverified="Also give Unverified role")
 async def cmd_unquarantine(
