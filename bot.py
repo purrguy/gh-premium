@@ -2870,7 +2870,34 @@ async def cmd_ban(
         ephemeral=True,
     )
 
-@bot.tree.command(name="unquarantine", description="Remove quarantine role")
+@bot.tree.command(name="gameban", description="Ban in-game by key/hwid/username/user_id (admin)")
+@app_commands.describe(key="License key", hwid="HWID (8+ chars)", username="Roblox username", user_id="Roblox user id", reason="Reason")
+async def cmd_gameban(
+    interaction: discord.Interaction,
+    key: Optional[str] = None,
+    hwid: Optional[str] = None,
+    username: Optional[str] = None,
+    user_id: Optional[str] = None,
+    reason: Optional[str] = None,
+):
+    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    payload = {"reason": reason or "Banned from Greedy Hudzell"}
+    if key: payload["key"] = key.strip()
+    if hwid: payload["hwid"] = hwid.strip()
+    if username: payload["username"] = username.strip()
+    if user_id: payload["user_id"] = user_id.strip()
+    if not any([key, hwid, username, user_id]):
+        await interaction.followup.send("Provide at least one of key/hwid/username/user_id.", ephemeral=True)
+        return
+    status, data = await api("POST", "/admin/ban", payload)
+    if status != 200 or not (isinstance(data, dict) and data.get("success")):
+        await interaction.followup.send(f"Game ban failed (HTTP {status}): `{data}`", ephemeral=True)
+        return
+    await interaction.followup.send(f"🔨 Banned in-game. `{data}`", ephemeral=True)
+
 @app_commands.describe(member="User", give_unverified="Also give Unverified role")
 async def cmd_unquarantine(
     interaction: discord.Interaction,
